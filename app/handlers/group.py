@@ -1,162 +1,445 @@
 import logging
-# 导入所需组件
-from ..settings import settings # 访问设置
-from ..tg_utils import tg, copy_any # Telegram API 工具
-from ..translate import translate # 翻译工具
-from ..services.conversation_service import ConversationService # 导入服务层
-from .commands import handle_commands # 导入命令处理器
+from ..settings import settings
+from ..tg_utils import tg, copy_any, send_with_prefix
+from ..services.conversation_service import ConversationService, MESSAGE_LIMIT_BEFORE_BIND
+from .commands import handle_commands
 
 logger = logging.getLogger(__name__)
 
+
 async def handle_group(msg: dict, conv_service: ConversationService):
-    """
-    处理支持群组聊天中的入站消息。
-    包括命令处理和将管理员回复转发给用户。
+    """处理支持群组聊天和外部群组的入站消息。"""
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    sender_user = msg.get("from")
+    sender_id = sender_user.get("id") if sender_user else None
+    sender_name = sender_user.get("first_name", "未知用户") if sender_user else "未知用户"
+    original_content = msg.get("text") or msg.get("caption")
 
-    Args:
-        msg: Telegram 消息更新字典.
-        conv_service: 用于业务逻辑的 ConversationService 实例.
-    """
-    tid = msg.get("message_thread_id") # 话题 ID
-    # 仅处理话题线程内的消息
-    if not tid:
-        logger.debug(f"忽略聊天 {msg.get('chat',{}).get('id')} 中非话题线程的消息 {msg.get('message_id')}.")
-        return
+    logger.info(
+        f"处理来自聊天 {chat_id} (类型: {msg.get('chat', {}).get('type')}) 的消息 {message_id}, 发送者 {sender_id} ({sender_name})")
 
-    message_id = msg.get("message_id") # 消息 ID
-    admin_sender = msg.get("from") # 发送消息/命令的管理员对象
-    admin_sender_id = admin_sender.get("id") if admin_sender else "N/A" # 发送者 ID
-    admin_sender_name = admin_sender.get("first_name", "未知管理员") if admin_sender else "未知管理员" # 发送者名字
-    original_content = msg.get("text") or msg.get("caption") # 要翻译的内容，不含管理员前缀
+    # --- 检查消息来源 ---
+    if conv_service.is_support_group(str(chat_id)):
+        # --- 消息来自客服支持群组 ---
+        tid = msg.get("message_thread_id")
+        if not tid:
+            logger.debug(f"忽略客服支持群组 {chat_id} 中非话题线程的消息 {message_id}.")
+            return
 
-    logger.info(f"处理来自管理员 {admin_sender_id} ({admin_sender_name}) 在话题 {tid} 中的群组消息 {message_id}")
+        logger.info(f"处理客服支持群组 {chat_id} 中话题 {tid} 的消息 {message_id}，发送者 {sender_id} ({sender_name})")
 
-    # --- 检查是否为服务消息 ---
-    # 服务消息通常没有 text, caption, photo, video 等字段
-    # 可以通过检查这些内容字段是否存在来判断
-    if not (msg.get("text") or msg.get("caption") or msg.get("photo") or msg.get("video") or msg.get("sticker") or msg.get("animation") or msg.get("document") or msg.get("audio") or msg.get("voice") or msg.get("contact") or msg.get("location") or msg.get("venue") or msg.get("poll") or msg.get("game") or msg.get("invoice") or msg.get("successful_payment") or msg.get("passport_data")):
-         # 这可能是服务消息，例如话题创建消息
-         logger.debug(f"检测到话题 {tid} 中的消息 {message_id} 可能为服务消息，跳过处理。")
-         return # 跳过处理服务消息
+        # --- 检查是否为服务消息 ---
+        is_content_message = any(msg.get(key) for key in
+                                 ["text", "caption", "photo", "video", "sticker", "animation", "document", "audio",
+                                  "voice", "contact", "location", "venue", "poll", "game", "invoice",
+                                  "successful_payment", "passport_data"])
+        if not is_content_message:
+            logger.debug(f"检测到话题 {tid} 中的消息 {message_id} 可能为服务消息，跳过处理。")
+            return
 
-    # --- 1. 处理命令 ---
-    # 命令通常位于文本消息的开头
-    # 在检查是否为服务消息之后再检查命令
-    if original_content and original_content.strip().startswith("/"): # 检查原始内容是否以 / 开头
-        logger.info(f"在话题 {tid} 中检测到命令: '{original_content}'")
-        # handle_commands 函数会根据需要检索话题关联的用户 ID
-        # 并处理命令逻辑，包括向管理员发送命令执行结果反馈
-        await handle_commands(tid, admin_sender_id, original_content.strip(), conv_service)
-        return # 如果是命令，停止处理消息内容
+        # --- 1. 处理命令 ---
+        if original_content and original_content.strip().startswith("/"):
+            logger.info(f"在话题 {tid} 中检测到命令: '{original_content}'")
+            await handle_commands(tid, sender_id, original_content.strip(), conv_service)
+            return
 
-
-    # --- 2. 处理管理员回复 (如果不是命令或服务消息) ---
-    # 查找与此话题线程关联的用户对话
-    conv = None
-    try:
-        conv = await conv_service.get_conversation_by_topic(tid)
-        if not conv:
-             logger.warning(f"收到非命令/服务消息 {message_id} 在话题 {tid} 中，但未找到关联对话。忽略。")
-             # 可选地在话题中通知管理员: "此话题未关联用户对话。"
-             # try: await tg("sendMessage", {"chat_id": settings.GROUP_ID, "message_thread_id": tid, "text": "注意：此话题未关联用户对话，消息不会转发给用户。"}) except Exception: pass
-             return # 忽略与任何用户对话不关联的话题中的消息
-
-        # 检查对话是否已关闭。如果已关闭，不转发管理员回复给用户。
-        if conv.status == "closed":
-             logger.info(f"收到管理员消息 {message_id} 在已关闭的话题 {tid} (用户 {conv.user_id}) 中。不转发给用户。")
-             # 也许给管理员发送一个温和的提示？
-             # try: await tg("sendMessage", {"chat_id": settings.GROUP_ID, "message_thread_id": tid, "text": "注意：此对话已标记为关闭，消息不会转发给用户。"}) except Exception: pass
-             return # 如果对话已关闭，不转发消息内容
-
-    except Exception as e: # 捕获查找对话可能发生的错误
-        logger.error(f"处理消息 {message_id} 时，查找话题 {tid} 对应的对话失败: {e}", exc_info=True)
-        # 如果无法获取用户 ID，就无法转发。
+        # --- 2. 处理管理员回复 ---
+        conv = None
         try:
-            # 修正 chat_id 参数，使用 settings.GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.GROUP_ID, "message_thread_id": tid, "text": "处理消息失败：无法获取对话信息，消息未转发。"})
-        except Exception as e_notify:
-            logger.warning(f"发送'查找对话失败'消息到话题 {tid} 失败: {e_notify}")
-        return
+            conv = await conv_service.get_conversation_by_topic(tid)
+            if not conv:
+                logger.warning(f"收到非命令/服务消息 {message_id} 在话题 {tid} 中，但未找到关联对话。忽略。")
+                try:
+                    await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
+                                             "text": "注意：此话题未关联对话实体，消息不会转发。"})
+                except Exception:
+                    pass
+                return
 
-
-    # --- 3. 机器翻译 (管理员 -> 用户) ---
-    # 尝试将管理员消息的文本或 caption 翻译成用户的目标语言
-    user_target_lang = conv.lang # 从对话对象中获取用户目标语言
-    # original_content 在函数开头已获取
-
-    msg_to_copy = msg.copy() # 创建消息字典的副本进行修改
-
-    # --- 问题 4: 添加管理员名字到消息内容 ---
-    # 在原始内容前添加管理员名字
-    admin_prefix = f"👤 {admin_sender_name}:\n"
-    # 只有当原始内容存在时才添加前缀
-    if original_content:
-        if "text" in msg_to_copy and msg_to_copy.get("text") is not None:
-            msg_to_copy["text"] = admin_prefix + msg_to_copy["text"]
-        elif "caption" in msg_to_copy and msg_to_copy.get("caption") is not None:
-            msg_to_copy["caption"] = admin_prefix + msg_to_copy["caption"]
-
-
-    # --- 问题 5: 翻译判断和执行 ---
-    # 仅在以下情况下尝试翻译:
-    # - 用户目标语言已设置 (不是 None 且不是空字符串)
-    # - 用户目标语言不在管理员常用的语言列表 settings.ADMIN_LANGS 中
-    # - 消息有内容 (original_content)
-    # - 内容长度大于某个阈值且不像命令/标记
-    # 如果用户目标语言是 zh 或 en，或者未设置，将不会进行管理员消息到用户语言的翻译。
-    if user_target_lang and user_target_lang.strip() and user_target_lang.lower() not in [lang.lower() for lang in settings.ADMIN_LANGS] and original_content: # 将 settings.ADMIN_LANGS 中的语言转小写再比较，增强健壮性
-         if len(original_content) > 5 and not original_content.strip().startswith(('/', '[', '【', '（')):
-            logger.debug(f"正在为话题 {tid} 中的消息 {message_id} (内容: '{original_content[:50]}...') 尝试翻译到用户语言 '{user_target_lang}'")
+            if conv.status == "closed":
+                logger.info(
+                    f"收到管理员消息 {message_id} 在已关闭的话题 {tid} (实体 {conv.entity_type} ID {conv.entity_id}) 中。不转发。")
+                try:
+                    await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
+                                             "text": "注意：此对话已标记为关闭，消息不会转发。"})
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            logger.error(f"处理消息 {message_id} 时，查找话题 {tid} 对应的对话失败: {e}", exc_info=True)
             try:
-                # 翻译原始内容 (不含管理员前缀)
-                translated_text = await translate(original_content, user_target_lang)
-                if translated_text and translated_text.strip() != original_content.strip(): # 避免翻译结果与原始内容完全相同
-                    translation_note = f"\n———\n💬机翻: {translated_text}"
-                    # 将翻译结果添加到 text 或 caption 中，添加到 管理员前缀 + 原始内容 之后
-                    if "text" in msg_to_copy:
-                        msg_to_copy["text"] = msg_to_copy.get("text", "") + translation_note
-                    elif "caption" in msg_to_copy:
-                        msg_to_copy["caption"] = msg_to_copy.get("caption", "") + translation_note
-                    logger.debug(f"成功将话题 {tid} 中的消息 {message_id} 翻译给了用户.")
-                else:
-                     logger.debug(f"管理员消息 {message_id} 翻译到 {user_target_lang} 结果为空或与原文相同，跳过添加翻译注释。")
-
-            except Exception as e:
-                logger.warning(f"管理员消息 {message_id} 翻译失败 (管理员 -> 用户) 到语言 '{user_target_lang}': {e}", exc_info=True)
-                translation_note = "\n———\n💬机翻失败"
-                if "text" in msg_to_copy:
-                    msg_to_copy["text"] = msg_to_copy.get("text", "") + translation_note
-                elif "caption" in msg_to_copy:
-                    msg_to_copy["caption"] = msg_to_copy.get("caption", "") + translation_note
-
-        # --- 4. 复制消息到用户的私聊 ---
-    try:
-            # 将修改后的 msg_to_copy 的 text 和 caption 显式传递
-            # 这些内容现在包含了管理员前缀和可能的翻译注释
-            # copy_any 内部会调用 tg()
-        await copy_any(settings.GROUP_ID, conv.user_id, message_id,
-                           {"text": msg_to_copy.get("text"),
-                            "caption": msg_to_copy.get("caption")
-                           })
-        logger.info(f"成功复制话题 {tid} 中的消息 {message_id} 给用户 {conv.user_id}")
-    except Exception as e:
-            # 捕获 copy_any 失败的异常
-            logger.error(f"复制话题 {tid} 中的消息 {message_id} 给用户 {conv.user_id} 失败: {e}", exc_info=True)
-            # 在话题中通知管理员，消息发送给用户失败
-            try:
-                # 修正 chat_id 参数，使用 settings.GROUP_ID
-                await tg("sendMessage", {"chat_id": settings.GROUP_ID, "message_thread_id": tid, "text": "发送给用户失败，请检查日志。"})
+                await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
+                                         "text": "处理消息失败：无法获取对话实体信息，消息未转发。"})
             except Exception as e_notify:
-                 # 捕获发送通知失败的异常
-                 logger.warning(f"发送'发送给用户失败'通知到话题 {tid} 失败: {e_notify}")
+                logger.warning(f"发送'查找实体失败'消息到话题 {tid} 失败: {e_notify}")
+            return
 
-    # --- 5. 记录出站消息 ---
-    # 消息转发 (尝试) 成功后，将原始消息内容记录到数据库
-    # 记录原始内容，不包含管理员前缀和翻译注释
-    # original_body 在函数开头已获取
-    if conv: # 确保对话对象存在
+        # --- 3. 添加发送者名字后缀 (管理员回复) ---
+        suffix = f"\n-- 发送者: {sender_name}"
+        # 构建 copy_params，正确处理 text 和 caption
+        copy_params = {}
+        current_text = msg.get("text")
+        current_caption = msg.get("caption")
+
+        if current_text is not None:  # 包括空字符串
+            copy_params["text"] = current_text + suffix
+        elif current_caption is not None:  # 包括空字符串
+            copy_params["caption"] = current_caption + suffix
+        # 如果都没有，但有其他媒体，则 suffix 不会添加，这是期望行为
+
+        # --- 4. 复制消息到实体聊天 ---
         try:
-            # 记录原始内容 (不包含管理员前缀和翻译注释)
-            await conv_service.record_outgoing_message(conv_id=conv.user_id, tg_mid=message_id, body=original_content)
-        except Exception as e: # 记录消息失败是一个非关键错误，只需日志记录
-            logger.error(f"记录用户 {conv.user_id} 的出站消息 {message_id} (来自话题 {tid}) 失败: {e}", exc_info=True)
+            await copy_any(
+                src_chat_id=settings.SUPPORT_GROUP_ID,  # 源是客服群
+                dst_chat_id=conv.entity_id,  # 目标是关联的实体 (用户或群组)
+                message_id=message_id,  # 要复制的消息 ID
+                extra_params=copy_params  # 包含修改后文本/标题的参数
+            )
+            logger.info(f"成功复制话题 {tid} 中的消息 {message_id} 到实体 {conv.entity_type} ID {conv.entity_id}")
+        except Exception as e:
+            logger.error(
+                f"复制话题 {tid} 中的消息 {message_id} 到实体 {conv.entity_type} ID {conv.entity_id} 失败: {e}",
+                exc_info=True)
+            try:
+                await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID,
+                                         "message_thread_id": tid,
+                                         "text": f"❗ 复制消息失败，无法发送给实体 {conv.entity_type} ID {conv.entity_id}。\n原始消息: {(original_content or '')[:100]}..."})
+            except Exception as e_notify:
+                logger.warning(f"发送'复制失败'通知到话题 {tid} 失败: {e_notify}")
+
+        # --- 5. 记录出站消息 ---
+        if conv:
+            try:
+                await conv_service.record_outgoing_message(
+                    conv_id=conv.entity_id,
+                    conv_entity_type=conv.entity_type,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    tg_mid=message_id,
+                    body=original_content
+                )
+            except Exception as e:
+                logger.error(f"记录出站消息 for conv {conv.entity_id} (TG MID: {message_id}) 失败: {e}", exc_info=True)
+
+    elif conv_service.is_external_group(chat_id):
+        # --- 消息来自需要监听的外部群组 ---
+        logger.info(
+            f"处理来自外部群组 {chat_id} (类型: {msg.get('chat', {}).get('type')}) 的消息 {message_id}, 发送者 {sender_id} ({sender_name})")
+
+        # --- 检查是否为服务消息或机器人自己的消息 ---
+        is_content_message = any(msg.get(key) for key in
+                                 ["text", "caption", "photo", "video", "sticker", "animation", "document", "audio",
+                                  "voice", "contact", "location", "venue", "poll", "game", "invoice",
+                                  "successful_payment", "passport_data"])
+        if not is_content_message:
+            logger.debug(f"检测到外部群组 {chat_id} 中的消息 {message_id} 可能为服务消息，跳过处理。")
+            return
+        if sender_id is not None and str(sender_id) == settings.BOT_TOKEN.split(':')[0]:
+            logger.debug(f"检测到外部群组 {chat_id} 中的消息 {message_id} 是 Bot 自己发的，跳过处理。")
+            return
+
+        # --- 获取群组名称 ---
+        group_name = f"群组 {chat_id}"
+        try:
+            chat_info = await tg("getChat", {"chat_id": chat_id})
+            group_name = chat_info.get("title", group_name)
+        except Exception as e:
+            logger.warning(f"获取外部群组 {chat_id} 名称失败: {e}", exc_info=True)
+
+        # --- 获取或创建群组对话实体 ---
+        group_conv = await conv_service.get_conversation_by_entity(chat_id, 'group')
+
+        # 处理绑定命令 (群组内)
+        if original_content and original_content.strip().lower().startswith("/bind "):
+            logger.info(f"在外部群组 {chat_id} 检测到 /bind 命令。")
+            args = original_content.strip().split(maxsplit=1)
+            if len(args) > 1:
+                custom_bind_id = args[1]
+                logger.info(f"外部群组 {chat_id} ({group_name}) 尝试使用ID进行绑定: {custom_bind_id}")
+                # 假设群组内的 /bind 命令由管理员发出，代表整个群组进行绑定
+                success = await conv_service.bind_entity(chat_id, 'group', group_name, custom_bind_id)
+                logger.info(f"群组 {chat_id} 绑定到 {custom_bind_id} 尝试结果: {success}")
+            else:
+                try:
+                    await tg("sendMessage", {"chat_id": chat_id, "text": "用法: /bind <群组专属自定义ID>"})
+                except Exception:
+                    pass
+            return  # /bind 命令处理完毕
+
+        # 如果没有对话记录，或者记录中没有 topic_id
+        if not group_conv or not group_conv.topic_id:
+            logger.info(f"外部群组 {chat_id} ({group_name}) 没有带话题的活动对话。正在创建。")
+            group_conv = await conv_service.create_initial_conversation_with_topic(chat_id, 'group', group_name)
+            if not group_conv or not group_conv.topic_id:
+                logger.error(f"为群组 {chat_id} 创建初始对话/话题失败。")
+                # 不在群组中发送失败通知，避免干扰
+                return
+
+            # 新对话和话题已创建，状态为 'pending' 验证。
+            # 提示群组进行绑定。
+            try:
+                await tg("sendMessage", {
+                    "chat_id": chat_id,  # 发送到外部群组
+                    "text": (
+                        f"欢迎！本群组的客服协助通道已创建。\n"
+                        f"为了将本群组消息正确路由给客服，请群管理员使用 /bind <群组专属自定义ID> 命令完成绑定。\n"
+                        f"在绑定前，本群组最多可以发送 {MESSAGE_LIMIT_BEFORE_BIND} 条消息给客服系统。"
+                    )
+                })
+            except Exception:
+                pass
+            # 继续处理当前消息
+
+        # 对话存在 (group_conv 不为 None 且 group_conv.topic_id 不为 None)
+        elif group_conv.is_verified != 'verified':
+            logger.info(f"外部群组 {chat_id} (话题 {group_conv.topic_id}) 的对话待验证。")
+            new_count, limit_reached = await conv_service.increment_message_count_and_check_limit(group_conv.entity_id,
+                                                                                                  group_conv.entity_type)
+
+            if limit_reached:
+                logger.warning(f"外部群组 {chat_id} (话题 {group_conv.topic_id}) 未验证对话达到消息限制。正在关闭。")
+                await conv_service.close_conversation(group_conv.topic_id, group_conv.entity_id, group_conv.entity_type)
+                try:
+                    await tg("sendMessage", {"chat_id": chat_id,
+                                             "text": f"本群组的未验证客服对话已达到消息限制 ({MESSAGE_LIMIT_BEFORE_BIND}条)，对话已关闭。请管理员先完成绑定：/bind <群组专属自定义ID>"})
+                except Exception:
+                    pass
+                return
+            else:
+                # 未达到限制，但仍未验证。再次提示（如果不是命令）。
+                if not (original_content and original_content.strip().startswith("/")):
+                    try:
+                        await tg("sendMessage", {"chat_id": chat_id,
+                                                 "text": f"本群组的客服对话仍需绑定。请管理员发送 /bind <群组专属自定义ID>。 ({new_count}/{MESSAGE_LIMIT_BEFORE_BIND} 条消息)"})
+                    except Exception:
+                        pass
+                # 继续处理消息
+
+        elif group_conv.status == "closed":
+            # 如果群组向已关闭的对话发送消息，重新开启它。
+            # 通常不因群组成员发送的命令而重新开启。
+            if not (original_content and original_content.strip().startswith("/")):
+                logger.info(
+                    f"来自外部群组 {chat_id} 的消息发送到已关闭的对话 (话题 {group_conv.topic_id})。正在重新开启。")
+                try:
+                    await conv_service.reopen_conversation(group_conv.entity_id, group_conv.entity_type,
+                                                           group_conv.topic_id)
+                    group_conv.status = "open"  # 更新本地 conv 对象状态
+                except Exception as e:
+                    logger.error(f"为群组 {chat_id} 重新开启对话失败: {e}", exc_info=True)
+                    try:
+                        await tg("sendMessage", {"chat_id": chat_id, "text": "无法重新开启客服对话，请稍后再试。"})
+                    except Exception:
+                        pass
+                    return
+            else:  # 是已关闭群组话题中的命令，通常忽略或按需特别处理
+                logger.debug(f"在已关闭的群组 {chat_id} 话题中收到命令 '{original_content}'。暂时忽略。")
+                return
+
+        # 此时，group_conv 应为 'open'，有 topic_id。
+        # 如果是 'pending' 验证，则未超过消息限制。
+        # 将消息从外部群组转发到支持话题。
+
+        # --- 添加发送者和群组信息前缀 ---
+        # (这里的 group_name 应该使用上面获取的，而不是 group_conv.entity_name，因为 group_conv 可能刚创建)
+        group_name_for_prefix = group_name or f"群组 {chat_id}"
+        sender_name_for_prefix = sender_name or f"用户 {sender_id}"
+        # prefix = f"🏠 {group_name_for_prefix} | 👤 {sender_name_for_prefix}:\n" # send_with_prefix 会处理前缀
+
+        # --- 5. 复制消息到客服支持话题 ---
+        if group_conv and group_conv.topic_id:  # 确保对话和话题有效
+            try:
+                await send_with_prefix(
+                    source_chat_id=chat_id,
+                    dest_chat_id=settings.SUPPORT_GROUP_ID,
+                    message_thread_id=group_conv.topic_id,
+                    sender_name=f"🏠{group_name_for_prefix} | 👤{sender_name_for_prefix}",  # 构建完整前缀传递给 sender_name
+                    msg=msg
+                )
+                logger.info(f"成功复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id}")
+            except Exception as e:
+                logger.error(f"复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id} 失败: {e}",
+                             exc_info=True)
+                try:
+                    await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID,
+                                             "message_thread_id": group_conv.topic_id,
+                                             "text": f"❗ 从群组 {chat_id} ({group_name_for_prefix}) 复制消息失败。\n发送者: {sender_name_for_prefix}\n原始消息: {(original_content or '')[:100]}..."})
+                except Exception as e_notify:
+                    logger.warning(f"发送'复制失败'通知到话题 {group_conv.topic_id} 失败: {e_notify}")
+
+            # --- 6. 记录入站消息 ---
+            try:
+                await conv_service.record_incoming_message(
+                    conv_id=group_conv.entity_id,
+                    conv_entity_type='group',
+                    sender_id=sender_id,
+                    sender_name=sender_name,  # 记录原始发送者名字
+                    tg_mid=message_id,
+                    body=original_content
+                )
+            except Exception as e:
+                logger.error(f"记录外部群组 {chat_id} 的入站消息 {message_id} 失败: {e}", exc_info=True)
+        else:
+            logger.warning(f"外部群组 {chat_id} 的对话或话题无效，无法转发或记录消息 {message_id}。")
+
+    else:
+        # --- 消息来自既不是支持群组也不是外部群组的聊天 ---
+        logger.info(f"消息来自外部群组 {chat_id}。按外部群组逻辑处理。")
+        # 1. 跳过服务消息或机器人自己的消息
+        is_content_message = any(msg.get(key) for key in
+                                 ["text", "caption", "photo", "video", "sticker", "animation", "document", "audio",
+                                  "voice", "contact", "location", "venue", "poll", "game", "invoice",
+                                  "successful_payment", "passport_data"])
+        if not is_content_message:
+            logger.debug(f"检测到外部群组 {chat_id} 中的消息 {message_id} 可能为服务消息，跳过处理。")
+            return
+        if sender_id is not None and str(sender_id) == settings.BOT_TOKEN.split(':')[0]:
+            logger.debug(f"检测到外部群组 {chat_id} 中的消息 {message_id} 是 Bot 自己发的，跳过处理。")
+            return
+
+        # 2. 获取群组名称
+        group_name = f"群组 {chat_id}"
+        try:
+            chat_info = await tg("getChat", {"chat_id": chat_id})
+            group_name = chat_info.get("title", group_name)
+        except Exception as e:
+            logger.warning(f"获取外部群组 {chat_id} 名称失败: {e}", exc_info=True)
+
+        # 3. 获取或创建群组对话实体
+        group_conv = await conv_service.get_conversation_by_entity(chat_id, 'group')
+
+        # 4. 处理群组内的 /bind 命令 (如果需要，或者由管理员在私聊或客服话题中为群组绑定)
+        if original_content and original_content.strip().lower().startswith("/bind "):
+            logger.info(f"在外部群组 {chat_id} 检测到 /bind 命令。")
+            args = original_content.strip().split(maxsplit=1)
+            if len(args) > 1:
+                custom_bind_id = args[1]
+                logger.info(f"外部群组 {chat_id} ({group_name}) 尝试使用ID进行绑定: {custom_bind_id}")
+                success = await conv_service.bind_entity(chat_id, 'group', group_name, custom_bind_id)
+                logger.info(f"群组 {chat_id} 绑定到 {custom_bind_id} 尝试结果: {success}")
+            else:
+                try:
+                    await tg("sendMessage", {"chat_id": chat_id, "text": "用法: /bind <群组专属自定义ID>"})
+                except Exception:
+                    pass
+            return  # /bind 命令处理完毕
+
+        # 5. 如果没有对话记录，或者记录中没有 topic_id，则创建初始对话和话题
+        if not group_conv or not group_conv.topic_id:
+            logger.info(f"外部群组 {chat_id} ({group_name}) 没有带话题的活动对话。正在创建。")
+            group_conv = await conv_service.create_initial_conversation_with_topic(chat_id, 'group', group_name)
+            if not group_conv or not group_conv.topic_id:  # 再次检查确保成功
+                logger.error(f"为群组 {chat_id} 创建初始对话/话题失败。")
+                return
+
+            try:
+                await tg("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": (
+                        f"欢迎！本群组的客服协助通道已创建。\n"
+                        f"为了将本群组消息正确路由给客服，请群管理员使用 /bind <群组专属自定义ID> 命令完成绑定。\n"
+                        f"在绑定前，本群组最多可以发送 {MESSAGE_LIMIT_BEFORE_BIND} 条消息给客服系统。"
+                    )
+                })
+            except Exception:
+                pass
+            # 继续处理当前消息
+
+        # 6. 处理未验证对话的消息限制和状态
+        elif group_conv.is_verified != 'verified':  # 对话存在，有话题，但未验证
+            logger.info(f"外部群组 {chat_id} (话题 {group_conv.topic_id}) 的对话待验证。")
+            new_count, limit_reached = await conv_service.increment_message_count_and_check_limit(group_conv.entity_id,
+                                                                                                  group_conv.entity_type)
+            if limit_reached:
+                logger.warning(f"外部群组 {chat_id} (话题 {group_conv.topic_id}) 未验证对话达到消息限制。正在关闭。")
+                await conv_service.close_conversation(group_conv.topic_id, group_conv.entity_id, group_conv.entity_type)
+                try:
+                    await tg("sendMessage", {"chat_id": chat_id,
+                                             "text": f"本群组的未验证客服对话已达到消息限制 ({MESSAGE_LIMIT_BEFORE_BIND}条)，对话已关闭。请管理员先完成绑定：/bind <群组专属自定义ID>"})
+                except Exception:
+                    pass
+                return
+            else:
+                if not (original_content and original_content.strip().startswith("/")):
+                    try:
+                        await tg("sendMessage", {"chat_id": chat_id,
+                                                 "text": f"本群组的客服对话仍需绑定。请管理员发送 /bind <群组专属自定义ID>。 ({new_count}/{MESSAGE_LIMIT_BEFORE_BIND} 条消息)"})
+                    except Exception:
+                        pass
+                # 继续处理消息
+
+        elif group_conv.status == "closed":  # 对话已关闭
+            logger.info(
+                f"GROUP_HANDLER: 群组 {chat_id} 对话已关闭。当前 group_conv: entity_id={group_conv.entity_id if group_conv else 'N/A'}, type={group_conv.entity_type if group_conv else 'N/A'}, topic_id={group_conv.topic_id if group_conv else 'N/A'}, status={group_conv.status if group_conv else 'N/A'}, verified={group_conv.is_verified if group_conv else 'N/A'}")  # 调试日志
+            # 检查消息是否为命令，如果不是命令，则尝试重新打开
+            if not (original_content and original_content.strip().startswith("/")):
+                logger.info(f"GROUP_HANDLER: 群组 {chat_id} 发送非命令消息到已关闭对话。尝试重新开启。")
+                try:
+                    # 调用 service 的 reopen_conversation 方法
+                    # 需要传递正确的 topic_id，这个 topic_id 应该是 group_conv 中存储的关闭前的客服话题 ID
+                    if group_conv and group_conv.topic_id:  # 确保 group_conv 和 topic_id 有效
+                        await conv_service.reopen_conversation(group_conv.entity_id, group_conv.entity_type,
+                                                               group_conv.topic_id)
+                        # **关键：在 handler 层面也更新 group_conv 的状态**
+                        # 这样后续的转发逻辑才能正确判断对话已开启
+                        group_conv.status = "open"
+                        logger.info(
+                            f"GROUP_HANDLER: 群组 {chat_id} 对话已调用 reopen_conversation 并本地更新状态为 'open'. 新 group_conv.status: {group_conv.status}")
+                        # 重新开启成功后，当前这条消息应该被继续处理并转发
+                    else:
+                        logger.error(
+                            f"GROUP_HANDLER: 群组 {chat_id} 对话已关闭，但无法获取有效的 topic_id 来重新开启。group_conv: {group_conv}")
+                        # 也许通知群组或管理员
+                        return  # 无法重新开启，则不继续
+
+                except Exception as e:
+                    logger.error(f"GROUP_HANDLER: 为群组 {chat_id} 重新开启对话失败: {e}", exc_info=True)
+                    try:
+                        await tg("sendMessage", {"chat_id": chat_id, "text": "无法重新开启客服对话，请稍后再试。"})
+                    except Exception:
+                        pass
+                    return  # 重新开启失败，则不继续处理当前消息
+                # 如果重新开启成功，代码会继续往下执行到转发逻辑
+            else:  # 如果是命令
+                logger.debug(f"GROUP_HANDLER: 群组 {chat_id} 已关闭对话中的命令 '{original_content}'。忽略。")
+                return  # 不重新开启，也不转发命令
+
+            # 7. 转发消息到客服话题并记录
+            # 确保这里能正确判断 group_conv.status == "open"
+        logger.info(
+            f"GROUP_HANDLER: 准备转发前检查群组 {chat_id}。group_conv.topic_id: {group_conv.topic_id if group_conv else 'N/A'}, group_conv.status: {group_conv.status if group_conv else 'N/A'}")
+        if group_conv and group_conv.topic_id and group_conv.status == "open":
+            # ... (原有的 send_with_prefix 和 record_incoming_message 逻辑)
+            group_name_for_prefix = group_name or f"群组 {chat_id}"  # group_name 在前面已获取
+            sender_name_for_prefix = sender_name or f"用户 {sender_id}"
+            try:
+                await send_with_prefix(
+                    source_chat_id=chat_id,
+                    dest_chat_id=settings.SUPPORT_GROUP_ID,
+                    message_thread_id=group_conv.topic_id,
+                    sender_name=f"🏠{group_name_for_prefix} | 👤{sender_name_for_prefix}",
+                    msg=msg
+                )
+                logger.info(
+                    f"GROUP_HANDLER: 成功复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id}")
+            except Exception as e:
+                logger.error(
+                    f"GROUP_HANDLER: 复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id} 失败: {e}",
+                    exc_info=True)
+                # ... (错误通知) ...
+
+            try:
+                await conv_service.record_incoming_message(
+                    conv_id=group_conv.entity_id,
+                    conv_entity_type='group',
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    tg_mid=message_id,
+                    body=original_content
+                )
+            except Exception as e:
+                logger.error(f"GROUP_HANDLER: 记录外部群组 {chat_id} 的入站消息 {message_id} 失败: {e}", exc_info=True)
+        else:
+            logger.warning(
+                f"GROUP_HANDLER: 外部群组 {chat_id} 的对话状态不允许转发。topic_id: {group_conv.topic_id if group_conv else 'N/A'}, status: {group_conv.status if group_conv else 'N/A'}")

@@ -126,6 +126,77 @@ async def copy_any(src_chat_id, dst_chat_id, message_id: int, extra_params: dict
     # 调用 tg 函数，它现在包含了重试逻辑
     return await tg("copyMessage", payload)
 
+
+# --- 新增: 发送带前缀的消息方法 ---
+async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, sender_name, msg):
+    """发送带前缀的消息，根据消息类型选择不同的发送方法."""
+    # 修正: 格式化前缀，确保 sender_name 不为 None
+    prefix = f"👤 {sender_name or '未知发送者'}:\n"
+
+    # 创建消息副本进行修改
+    msg_to_send = msg.copy()
+
+    # 在消息文本或 caption 前添加前缀
+    original_body = msg_to_send.get("text") or msg_to_send.get("caption")
+
+    if original_body is not None:
+         if "text" in msg_to_send and msg_to_send.get("text") is not None:
+              msg_to_send["text"] = prefix + msg_to_send.get("text", "")
+         elif "caption" in msg_to_send and msg_to_send.get("caption") is not None:
+              msg_to_send["caption"] = prefix + msg_to_send.get("caption", "")
+
+
+    # 根据消息类型选择不同的发送方法
+    # Check common media types first, then text, then fallback to copyMessage
+    if "photo" in msg_to_send:
+         # 获取最大尺寸的图片
+         photo = sorted(msg_to_send.get("photo"), key=lambda x: x.get("width", 0), reverse=True)[0] if msg_to_send.get("photo") else None
+         if photo:
+              logger.debug(f"Sending photo with prefix to chat {dest_chat_id} topic {message_thread_id}")
+              # sendPhoto 参数不同于 copyMessage
+              return await tg("sendPhoto", {
+                  "chat_id": dest_chat_id,
+                  "message_thread_id": message_thread_id,
+                  "photo": photo.get("file_id"),
+                  "caption": msg_to_send.get("caption"), # 使用添加了前缀的 caption
+                  "parse_mode": "HTML"  # 可选
+              })
+    elif "video" in msg_to_send:
+         logger.debug(f"Sending video with prefix to chat {dest_chat_id} topic {message_thread_id}")
+         return await tg("sendVideo", {
+             "chat_id": dest_chat_id,
+             "message_thread_id": message_thread_id,
+             "video": msg_to_send.get("video", {}).get("file_id"),
+             "caption": msg_to_send.get("caption"), # 使用添加了前缀的 caption
+             "parse_mode": "HTML"  # 可选
+         })
+    elif "document" in msg_to_send:
+         logger.debug(f"Sending document with prefix to chat {dest_chat_id} topic {message_thread_id}")
+         return await tg("sendDocument", {
+             "chat_id": dest_chat_id,
+             "message_thread_id": message_thread_id,
+             "document": msg_to_send.get("document", {}).get("file_id"),
+             "caption": msg_to_send.get("caption"), # 使用添加了前缀的 caption
+             "parse_mode": "HTML"  # 可选
+         })
+    # ... Add other media types (audio, voice, sticker, animation) if needed ...
+
+    elif "text" in msg_to_send and msg_to_send.get("text") is not None: # 如果是纯文本消息 (已在前面添加前缀)
+         logger.debug(f"Sending text message with prefix to chat {dest_chat_id} topic {message_thread_id}")
+         return await tg("sendMessage", {
+             "chat_id": dest_chat_id,
+             "message_thread_id": message_thread_id,
+             "text": msg_to_send.get("text"), # 使用添加了前缀的 text
+             "parse_mode": "HTML"  # 可选
+         })
+    # 如果不是以上特殊处理的类型 (如贴纸、服务消息、其他未知类型)，仍然使用 copyMessage
+    else:
+        logger.debug(f"Falling back to copyMessage for message {msg_to_send.get('message_id')} (type: {', '.join(msg_to_send.keys()) if msg_to_send else 'unknown'})")
+        # 在 copyMessage 回退时，我们无法在接收方那边添加前缀，这是 send_* 方法的局限性
+        # copy_any 只需要原始消息ID，源chat ID，目标chat ID 和话题ID
+        return await copy_any(source_chat_id, dest_chat_id, msg_to_send.get("message_id"),
+                              {"message_thread_id": message_thread_id})
+
 # 可选: 添加一个函数在应用关闭时关闭 httpx 客户端
 # 在这个简单的示例结构中，我们依赖进程退出，但在大型应用中明确管理生命周期更好。
 async def close_http_client():
