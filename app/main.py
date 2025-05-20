@@ -60,7 +60,11 @@ async def startup_event():
     # 3. 初始化服务，在依赖项 (如 DB 连接) 准备好之后
     global conversation_service
     # 将必要的依赖项传递给服务构造函数
-    conversation_service = ConversationService(group_id=settings.GROUP_ID, tg_func=tg)
+    conversation_service = ConversationService(
+        support_group_id=settings.SUPPORT_GROUP_ID,  # Use the correct alias from settings
+        external_group_ids=settings.EXTERNAL_GROUP_IDS,  # Pass the external group IDs
+        tg_func=tg
+    )
     logger.info("ConversationService 已初始化。")
 
     # 4. 自动设置 Webhook URL
@@ -158,12 +162,12 @@ async def webhook(req: Request):
             await private.handle_private(msg, conversation_service)
         elif chat_type in ("group", "supergroup"):
             # 确保是正确的支持群组
-            if str(chat_id) == settings.GROUP_ID: # 将 chat_id 转换为字符串进行比较 (Telegram API 可能返回 int 或 string)
+            if str(chat_id) == settings.SUPPORT_GROUP_ID: # 将 chat_id 转换为字符串进行比较 (Telegram API 可能返回 int 或 string)
                 await group.handle_group(msg, conversation_service)
             else:
-                logger.debug(f"忽略在未配置聊天 {chat_id} 中的群组消息 {msg_id}")
-                # 可选: 自动离开意外的群组
-                # try: await tg("leaveChat", {"chat_id": chat_id}) except Exception: pass
+                # 这是来自其他群组的消息
+                logger.info(f"消息来自群组 {chat_id}，不是客服支持群。按外部群组逻辑处理。")  # <--- 这个日志应该要出现
+                await group.handle_group(msg, conversation_service)
         else:
              logger.debug(f"忽略未处理的聊天类型: {chat_type}")
 
