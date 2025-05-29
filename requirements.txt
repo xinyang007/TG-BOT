@@ -25,3 +25,4 @@ gunicorn
 PyMySQL
 pytz
 telethon
+Werkzeug

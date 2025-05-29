@@ -7,7 +7,7 @@ from ..services.conversation_service import ConversationService  # 导入服务�
 logger = logging.getLogger(__name__)
 
 # --- 定义需要管理员权限的命令 ---
-PRIVILEGED_COMMANDS = {"/ban", "/close", "/unban", "/setlang"}  # 您可以按需调整
+PRIVILEGED_COMMANDS = {"/ban", "/close", "/unban","/set_password","/setlang"}  # 您可以按需调整
 
 
 async def handle_commands(tid: int, admin_sender_id: int | str, text: str, conv_service: ConversationService):
@@ -22,8 +22,17 @@ async def handle_commands(tid: int, admin_sender_id: int | str, text: str, conv_
     """
     cmd, *args = text.split()
     cmd = cmd.lower()  # 命令不区分大小写
+    parts = text.strip().split(maxsplit=2)  # /cmd, arg1, arg2_and_onwards
 
     logger.info(f"管理员 {admin_sender_id} 在话题 {tid} 执行命令: '{text}'")
+
+    arg1 = None
+    arg2 = None  # 对于 /set_password，arg2 是密码 (可能为空或包含空格)
+
+    if len(parts) > 1:
+        arg1 = parts[1]
+    if len(parts) > 2:
+        arg2 = parts[2]  # 密码部分，保留原始大小写和空格
 
     # --- 权限检查 ---
     # 将 admin_sender_id 转为 int 类型进行比较
@@ -94,6 +103,33 @@ async def handle_commands(tid: int, admin_sender_id: int | str, text: str, conv_
             return
 
     # --- 命令处理逻辑 ---
+
+    # --- 命令处理逻辑 ---
+    if cmd == "/set_password":
+        custom_id_to_set = arg1
+        new_password_to_set = arg2  # 可能是 None (如果只提供了ID)，也可能是空字符串或实际密码
+
+        if not custom_id_to_set:
+            await tg("sendMessage", {
+                "chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
+                "text": "用法错误。\n设置密码: `/set_password <自定义ID> <新密码>`\n清除密码: `/set_password <自定义ID>` (密码部分留空)"
+            })
+            return
+
+        logger.info(
+            f"COMMANDS: 管理员 {sender_id_int} 尝试为ID '{custom_id_to_set}' 设置密码。提供的密码: '{'******' if new_password_to_set else '将清除密码'}'")
+
+        success, message = await conv_service.set_binding_id_password(custom_id_to_set, new_password_to_set)
+
+        reply_text = f"为自定义ID '{custom_id_to_set}' 操作密码结果：\n{message}"
+        if not success:
+            reply_text = f"❗ 操作失败：\n{message}"
+
+        await tg("sendMessage", {
+            "chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
+            "text": reply_text
+        })
+        return  # /set_password 命令处理完毕
 
     if cmd == "/close":
         # conv, entity_id_in_topic, entity_type_in_topic 在上面已检查并保证存在

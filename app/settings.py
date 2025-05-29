@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     DB_NAME: str = Field(..., description="Database name (仅用于 mysql)")
     DB_USER: str = Field(default=None, description="Database user (仅用于 mysql)")
     DB_PASSWORD: str = Field(default=None, description="Database password (仅用于 mysql)")
+    DB_MAX_CONNECTIONS: int = Field(default=20, description="数据库连接池最大连接数")
+    DB_STALE_TIMEOUT: int = Field(default=3600, description="数据库连接池中连接被视为空闲过久的超时时间 (秒)")
 
 
     # 安全设置: Webhook 路径的随机字符串

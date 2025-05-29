@@ -566,17 +566,42 @@ class ConversationService:
             raise
 
     async def bind_entity(self, entity_id: int | str, entity_type: str, entity_name: str | None,
-                          custom_id: str) -> bool:
+                          custom_id: str, password: str | None = None) -> bool:
         entity_id_int = int(entity_id)
         try:
-            # 1. 验证自定义 ID (这部分逻辑不变)
-            binding_id_entry: BindingID = await run_in_threadpool(BindingID.get_or_none,
-                                                                  BindingID.custom_id == custom_id)
+            # 首先检查实体是否已经绑定
+            conv: Conversation = await self.get_conversation_by_entity(entity_id_int, entity_type)
+            if conv and conv.is_verified == 'verified':
+                logger.info(f"BIND_ENTITY: 实体 {entity_type} ID {entity_id_int} 已经绑定。")
+                await self.tg("sendMessage",
+                              {"chat_id": entity_id_int, "text": "您已经完成绑定，无需重复绑定。"})
+                return True
+            # 1. 验证自定义 ID 和密码
+            def _get_binding_id():
+                from ..store import db as service_db
+                with service_db.connection_context():
+                    return BindingID.get_or_none(BindingID.custom_id == custom_id)
+            binding_id_entry: BindingID | None = await run_in_threadpool(_get_binding_id)
+
             if not binding_id_entry:  # 无效ID
                 logger.warning(f"BIND_ENTITY: 自定义 ID '{custom_id}' 不存在。实体: {entity_type} ID {entity_id_int}")
                 await self.tg("sendMessage",
                               {"chat_id": entity_id_int, "text": f"绑定失败：自定义 ID '{custom_id}' 无效或未被授权。"})
                 return False
+                # --- 密码校验 ---
+            if binding_id_entry.password_hash:  # 如果这个绑定ID设置了密码
+                if not password:  # 用户没有提供密码
+                    logger.warning(
+                        f"BIND_ENTITY: ID '{custom_id}' 需要密码，但用户未提供。实体: {entity_type} ID {entity_id_int}")
+                    await self.tg("sendMessage", {"chat_id": entity_id_int,
+                                                      "text": f"绑定失败：此自定义 ID 需要密码。请使用 `/bind {custom_id} <密码>`"})
+                    return False
+                if not binding_id_entry.check_password(password):  # 密码不匹配
+                    logger.warning(f"BIND_ENTITY: ID '{custom_id}' 密码错误。实体: {entity_type} ID {entity_id_int}")
+                    await self.tg("sendMessage", {"chat_id": entity_id_int, "text": f"绑定失败：密码错误。"})
+                    return False
+                logger.info(f"BIND_ENTITY: ID '{custom_id}' 密码校验通过。")
+
             if binding_id_entry.is_used == 'used':  # ID 已被使用
                 # ... (检查是否被当前实体使用，如果是则返回 True，否则返回 False - 这部分逻辑不变)
                 existing_conv_for_custom_id: Conversation = await run_in_threadpool(
@@ -754,3 +779,48 @@ class ConversationService:
             logger.error(
                 f"Unexpected error while recording outgoing message for conv {conv_id} (TG MID: {tg_mid}): {e}",
                 exc_info=True)
+
+    async def set_binding_id_password(self, custom_id: str, new_password: str | None) -> tuple[bool, str]:
+        """
+        为指定的自定义ID设置或更新密码。
+        如果 new_password 为 None 或空字符串，则清除该ID的密码（使其无需密码即可绑定）。
+
+        Args:
+            custom_id: 要设置密码的自定义ID。
+            new_password: 新的明文密码，或 None/空字符串以清除密码。
+
+        Returns:
+            tuple[bool, str]: (操作是否成功, 反馈消息)
+        """
+        logger.info(f"SET_BIND_PASS: 尝试为自定义ID '{custom_id}' 设置新密码。")
+
+        if not custom_id:
+            return False, "自定义ID不能为空。"
+
+        def _update_password_in_db():
+            from ..store import db as service_db  # 确保在线程中使用正确的 db 实例
+            with service_db.atomic():  # 使用事务确保操作原子性
+                binding_entry: BindingID | None = BindingID.get_or_none(BindingID.custom_id == custom_id)
+                if not binding_entry:
+                    return False, f"自定义ID '{custom_id}' 不存在。"
+
+                if new_password and new_password.strip():  # 如果提供了非空的新密码
+                    binding_entry.set_password(new_password.strip())
+                    binding_entry.save()  # 保存更改
+                    logger.info(f"SET_BIND_PASS: 已为自定义ID '{custom_id}' 设置了新密码的哈希。")
+                    return True, f"已为自定义ID '{custom_id}' 设置新密码。"
+                else:  # 如果 new_password 是 None 或空字符串，表示清除密码
+                    binding_entry.password_hash = None
+                    binding_entry.save()
+                    logger.info(f"SET_BIND_PASS: 已清除自定义ID '{custom_id}' 的密码。现在无需密码即可绑定。")
+                    return True, f"已清除自定义ID '{custom_id}' 的密码。现在绑定时无需提供密码。"
+
+        try:
+            success, message = await run_in_threadpool(_update_password_in_db)
+            return success, message
+        except PeeweeException as e:
+            logger.error(f"SET_BIND_PASS: 设置自定义ID '{custom_id}' 密码时发生数据库错误: {e}", exc_info=True)
+            return False, "设置密码时发生数据库错误。"
+        except Exception as e:
+            logger.error(f"SET_BIND_PASS: 设置自定义ID '{custom_id}' 密码时发生意外错误: {e}", exc_info=True)
+            return False, "设置密码时发生意外错误。"

@@ -15,8 +15,18 @@ async def handle_private(msg: dict, conv_service: ConversationService):
     user_first_name = msg["from"].get("first_name", f"用户 {uid}")
     message_id = msg.get("message_id")
     original_body = msg.get("text") or msg.get("caption")
+
+    # 获取用户输入的原始文本用于命令解析，不转小写，因为ID和密码可能区分大小写
+    raw_text_content = msg.get("text", "").strip()
+
     is_start_command = msg.get("text", "").strip().lower() == "/start"
     is_bind_command = msg.get("text", "").strip().lower().startswith("/bind ")
+    # is_bind_command_alone: 用户只发送了 "/bind" (不区分大小写)
+    is_bind_command_alone = raw_text_content.lower() == "/bind"
+
+
+    is_bind_with_args_command = raw_text_content.lower().startswith("/bind ") and \
+                                len(raw_text_content.split(maxsplit=1)) > 1  # 确保 /bind 后面有内容
 
     logger.info(f"处理来自用户 {uid} 的私聊消息 {message_id}")
     if is_start_command:
@@ -46,22 +56,81 @@ async def handle_private(msg: dict, conv_service: ConversationService):
     conv = await conv_service.get_conversation_by_entity(uid, 'user')
 
     # --- 3. 处理绑定命令 ---
-    if is_bind_command:
-        logger.info(f"用户 {uid} 发送了 /bind 命令处理流程。")
-        custom_id_parts = msg.get("text", "").strip().split(maxsplit=1)
-        custom_id = custom_id_parts[1] if len(custom_id_parts) > 1 else None
+    if is_bind_command_alone:
+        # 先检查用户是否已经绑定验证通过
+        logger.info(f"PRIVATE_HANDLER: 用户 {uid} 发送了 /bind (无参数)，检查绑定状态。")
 
-        if not custom_id:
+        # 获取用户的对话记录（如果 conv 在上面还没有获取）
+        if not conv:
+            conv = await conv_service.get_conversation_by_entity(uid, 'user')
+
+        if conv and conv.is_verified == 'verified':
+            # 已经绑定验证通过，发送已绑定消息
+            logger.info(f"用户 {uid} 已经绑定验证通过，发送已绑定消息。")
             try:
-                await tg("sendMessage", {"chat_id": uid, "text": "请输入自定义 ID 进行绑定。用法: /bind <您的自定义ID>"})
-            except Exception:
-                pass
+                await tg("sendMessage", {
+                    "chat_id": uid,
+                    "text": "您已经完成绑定，无需重复绑定。"
+                })
+            except Exception as e:
+                logger.error(f"PRIVATE_HANDLER: 向用户 {uid} 发送已绑定消息失败: {e}", exc_info=True)
+        else:
+            # 未绑定或未验证，发送引导消息
+            logger.info(f"用户 {uid} 未绑定或未验证，发送引导消息。")
+            message_text = (
+                "好的，您准备绑定对话。\n"
+                "请按照以下格式回复您的自定义ID和密码进行绑定：\n\n"
+                "`/bind <您的自定义ID> [您的密码]`\n\n"
+                "例如：\n"
+                "`/bind anotherID PaSsWoRd` (如果此ID需要密码 `PaSsWoRd`)"
+            )
+            try:
+                await tg("sendMessage", {
+                    "chat_id": uid,
+                    "text": message_text,
+                    "parse_mode": "Markdown"
+                })
+            except Exception as e:
+                logger.error(f"PRIVATE_HANDLER: 向用户 {uid} 发送 /bind 引导消息失败: {e}", exc_info=True)
+        return  # 处理完毕，无论已绑定还是未绑定
+
+    elif is_bind_with_args_command:  # 用户发送了 /bind <ID> [密码]
+        logger.info(f"PRIVATE_HANDLER: 用户 {uid} 发送了带参数的 /bind 命令。")
+
+        # raw_text_content 是原始的、未转小写的用户输入，例如 "/bind MyCustomID MyPassword123"
+        # parts[0] 将是 "/bind" (或 "/BiNd" 等，取决于用户输入，但我们用 startswith("/bind ") 判断了)
+        # parts[1] 将是 "MyCustomID"
+        # parts[2] (如果存在) 将是 "MyPassword123"
+        command_parts = raw_text_content.split(maxsplit=2)
+
+        custom_id = None
+        password_provided = None  # 默认为 None，表示用户可能没有提供密码
+
+        if len(command_parts) > 1:  # 至少有 "/bind" 和 "<自定义ID>"
+            custom_id = command_parts[1]
+
+        if len(command_parts) > 2:  # 有 "/bind", "<自定义ID>", 和 "<密码>"
+            password_provided = command_parts[2]
+
+        if not custom_id:  # 理论上不会发生，因为 is_bind_with_args_command 保证了 /bind 后面有内容
+            logger.warning(f"PRIVATE_HANDLER: 用户 {uid} 发送的 /bind 命令解析自定义ID失败: '{raw_text_content}'")
+            await tg("sendMessage",
+                     {"chat_id": uid, "text": "绑定格式错误，未能解析自定义ID。请使用 `/bind <自定义ID> [密码]`"})
             return
 
-        success = await conv_service.bind_entity(uid, 'user', user_first_name, custom_id)
-        logger.info(f"用户 {uid} 绑定到 {custom_id} 尝试结果: {success}")
-        # bind_entity 内部会发送成功或失败消息给用户
-        return  # /bind 命令处理完毕
+        logger.info(
+            f"PRIVATE_HANDLER: 用户 {uid} 尝试绑定 ID: '{custom_id}', 提供密码: '{'******' if password_provided else '未提供'}'")
+
+        success = await conv_service.bind_entity(
+            entity_id=uid,
+            entity_type='user',
+            entity_name=user_first_name,
+            custom_id=custom_id,
+            password=password_provided  # 将解析出的密码传递给 service
+        )
+        logger.info(f"PRIVATE_HANDLER: 用户 {uid} 绑定到自定义 ID '{custom_id}' 的尝试结果: {success}")
+        # conv_service.bind_entity 内部会发送成功或失败的具体消息给用户
+        return  # /bind <ID> [密码] 命令处理完毕
 
     # --- 4. 处理对话状态和创建/重新开启逻辑 ---
     # 如果没有对话记录，或者记录中没有 topic_id (表示这是一个非常旧的待处理状态或错误状态)
@@ -83,7 +152,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 "chat_id": uid,
                 "text": (
                     "欢迎！您的客服对话已创建。\n"
-                    f"为了更好地为您服务，请尽快使用 /bind <您的自定义ID> 命令完成身份绑定。\n"
+                    f"为了更好地为您服务。\n 请尽快使用 /bind <后台ID> [密码] 命令完成身份绑定。\n"
                     f"在绑定前，您最多可以发送 {MESSAGE_LIMIT_BEFORE_BIND} 条消息。"
                 )
             })
@@ -182,7 +251,8 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                     logger.error(f"记录用户 {uid} 的入站 /start 命令 {message_id} 失败: {e}", exc_info=True)
             return  # 不转发 /start
 
-    elif not is_bind_command:  # 不要转发 /bind 命令本身
+    # 修改：所有命令消息都不转发
+    elif not (is_start_command or is_bind_command or is_bind_command_alone):  # 不转发任何命令消息
         # --- 5. 复制消息到群组话题 ---
         if conv and conv.topic_id:  # 确保对话和话题有效
             try:

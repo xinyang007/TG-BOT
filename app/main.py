@@ -53,7 +53,7 @@ async def startup_event():
     """FastAPI 应用启动时运行."""
     logger.info("应用启动中...")
     # 1. 连接数据库
-    connect_db()
+    # connect_db()
     # 2. 创建表 (包括 Conversation, Messages, BlackList) 如果它们不存在的话
     create_all_tables()
     logger.info("数据库连接并检查/创建了表。")
@@ -106,7 +106,7 @@ async def shutdown_event():
     """FastAPI 应用关闭时运行."""
     logger.info("应用关闭中...")
     # 1. 关闭数据库连接
-    close_db()
+    # close_db()
     # 2. 关闭用于 Telegram API 调用的 HTTP 客户端
     # 注意: 这需要异步关闭。如果在 tg_utils 中使用了特定的客户端实例，需要妥善处理其生命周期。
     # 目前 tg_utils 使用全局客户端，在此处干净地关闭比较棘手。

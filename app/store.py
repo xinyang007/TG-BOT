@@ -11,7 +11,9 @@ from peewee import (
     IntegerField # IntegerField for message count
 )
 # 导入 PyMySQLDatabase 如果您确定要用 playhouse 的特定版本，否则标准 MySQLDatabase 就够了
+from playhouse.pool import PooledMySQLDatabase
 
+from werkzeug.security import generate_password_hash, check_password_hash # 用于密码哈希
 
 # 导入用于索引长度的 SQL 对象
 from peewee import SQL # Import SQL object
@@ -47,16 +49,17 @@ def get_current_beijing_time():
 db = None
 if settings.DB_KIND == "mysql":
     try:
-        # 使用导入的标准的 MySQLDatabase 类来创建连接实例
-        # 当安装了 PyMySQL 驱动时，Peewee 的 MySQLDatabase 会自动使用 PyMySQL
-        db = MySQLDatabase(
+        db = PooledMySQLDatabase(  # 使用 PooledMySQLDatabase
             settings.DB_NAME,
             user=settings.DB_USER,
             password=settings.DB_PASSWORD,
             host=settings.DB_HOST,
             port=settings.DB_PORT,
             charset='utf8mb4',
-            # 其他连接参数如果需要可以添加
+            max_connections=getattr(settings, 'DB_MAX_CONNECTIONS', 20),  # 最大连接数，可配置
+            stale_timeout=getattr(settings, 'DB_STALE_TIMEOUT', 3600),  # 连接变成 "stale" 的超时时间 (秒)，例如 5 分钟
+            # 其他连接参数，例如：
+            connect_timeout=10
         )
         logger.info(f"使用 MySQL 数据库: {settings.DB_USER}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}")
 
@@ -170,8 +173,24 @@ class Messages(BaseModel):
 class BindingID(BaseModel):
     """存储预生成或可管理的自定义 ID."""
     custom_id = CharField(primary_key=True, max_length=255, help_text="自定义的唯一 ID") # 自定义的唯一 ID
+    password_hash = CharField(max_length=255, null=True, help_text="绑定密码的哈希值 (可选)")  # 允许密码为空，表示不需要密码
     is_used = TextField(default="unused", choices=[('unused', 'unused'), ('pending', 'pending'), ('used', 'used')], help_text="ID 使用状态 (unused, pending, used)")
     # 可以添加其他字段，如 creation_date, expiration_date 等
+    def set_password(self, password: str):
+        """设置密码 (存储哈希值)"""
+        if password:
+            self.password_hash = generate_password_hash(password)
+        else:
+            self.password_hash = None  # 如果密码为空字符串，则不设密码
+
+    def check_password(self, password: str) -> bool:
+        """校验提供的密码是否与存储的哈希匹配"""
+        if not self.password_hash:  # 如果数据库中没有存储密码哈希 (即不需要密码)
+            return True  # 任何密码（包括空）都视为通过，或者根据业务逻辑决定
+            # 如果希望无密码ID必须用空密码绑定，这里可以改为: return not password
+        if not password:  # 如果数据库需要密码，但用户没提供密码
+            return False
+        return check_password_hash(self.password_hash, password)
 
 
 class BlackList(BaseModel):
