@@ -1,275 +1,379 @@
-import logging
-# 导入其他模块所需组件
-from ..settings import settings  # 访问设置以获取 support_group_id 等
-from ..tg_utils import tg  # Telegram API 工具
-from ..services.conversation_service import ConversationService  # 导入服务层
+from ..settings import settings
+from ..tg_utils import tg
+from ..services.conversation_service import ConversationService
+from ..logging_config import get_logger, get_user_logger
+from ..validation import ValidationError
 
-logger = logging.getLogger(__name__)
+logger = get_logger("app.handlers.commands")
 
-# --- 定义需要管理员权限的命令 ---
-PRIVILEGED_COMMANDS = {"/ban", "/close", "/unban","/set_password","/setlang"}  # 您可以按需调整
+# 需要管理员权限的命令
+PRIVILEGED_COMMANDS = {"/ban", "/close", "/unban", "/set_password", "/setlang"}
+
+
+class CommandError(Exception):
+    """命令执行错误"""
+
+    def __init__(self, message: str, user_message: str = None):
+        self.message = message
+        self.user_message = user_message or message
+        super().__init__(message)
 
 
 async def handle_commands(tid: int, admin_sender_id: int | str, text: str, conv_service: ConversationService):
     """
-    处理管理员在客服支持群组话题中发送的命令。
+    处理管理员在客服支持群组话题中发送的命令
 
     Args:
-        tid: 发送命令的消息线程 ID (话题 ID).
-        admin_sender_id: 发送命令的管理员的 Telegram 用户 ID.
-        text: 完整的命令文本 (包括开头的 '/').
-        conv_service: 用于业务逻辑的 ConversationService 实例.
+        tid: 发送命令的消息线程 ID (话题 ID)
+        admin_sender_id: 发送命令的管理员的 Telegram 用户 ID
+        text: 完整的命令文本 (包括开头的 '/')
+        conv_service: 用于业务逻辑的 ConversationService 实例
     """
-    cmd, *args = text.split()
-    cmd = cmd.lower()  # 命令不区分大小写
-    parts = text.strip().split(maxsplit=2)  # /cmd, arg1, arg2_and_onwards
-
-    logger.info(f"管理员 {admin_sender_id} 在话题 {tid} 执行命令: '{text}'")
-
-    arg1 = None
-    arg2 = None  # 对于 /set_password，arg2 是密码 (可能为空或包含空格)
-
-    if len(parts) > 1:
-        arg1 = parts[1]
-    if len(parts) > 2:
-        arg2 = parts[2]  # 密码部分，保留原始大小写和空格
-
-    # --- 权限检查 ---
-    # 将 admin_sender_id 转为 int 类型进行比较
+    # 输入验证
     try:
-        sender_id_int = int(admin_sender_id)
-    except ValueError:
-        logger.warning(f"无效的管理员发送者ID格式: {admin_sender_id} (来自话题 {tid})。拒绝执行命令 '{text}'。")
-        # 可以在话题中回复一个通用错误，但不建议暴露过多细节
-        # await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid, "text": "命令执行失败：内部错误。"})
+        tid = int(tid)
+        admin_sender_id = int(admin_sender_id)
+        text = str(text).strip()
+
+        if not text.startswith('/'):
+            raise ValueError("无效的命令格式")
+
+    except (ValueError, TypeError) as e:
+        logger.error(
+            "命令参数验证失败",
+            extra={
+                "topic_id": tid,
+                "admin_id": admin_sender_id,
+                "text": text,
+                "validation_error": str(e)
+            }
+        )
         return
 
-    if cmd in PRIVILEGED_COMMANDS:  # 检查是否是需要权限的命令
-        if sender_id_int not in settings.ADMIN_USER_IDS:
-            logger.warning(f"用户 {sender_id_int} (非管理员) 尝试在话题 {tid} 执行特权命令 '{text}'。已拒绝。")
+    # 使用管理员相关的日志器
+    admin_logger = get_user_logger(admin_sender_id, "admin_command")
+
+    # 解析命令
+    cmd, *args = text.split()
+    cmd = cmd.lower()
+    parts = text.strip().split(maxsplit=2)
+
+    arg1 = parts[1] if len(parts) > 1 else None
+    arg2 = parts[2] if len(parts) > 2 else None
+
+    admin_logger.info(
+        "执行管理员命令",
+        extra={
+            "topic_id": tid,
+            "command": cmd,
+            "args_count": len(args),
+            "has_arg1": arg1 is not None,
+            "has_arg2": arg2 is not None
+        }
+    )
+
+    try:
+        # 权限检查
+        if cmd in PRIVILEGED_COMMANDS:
+            if admin_sender_id not in settings.ADMIN_USER_IDS:
+                admin_logger.warning(
+                    "非管理员尝试执行特权命令",
+                    extra={"command": cmd}
+                )
+                await send_error_message(tid, f"抱歉，您没有权限执行 {cmd} 命令。")
+                return
+
+        admin_logger.info("权限检查通过")
+
+        # 获取话题关联的对话信息（对于需要的命令）
+        conv = None
+        entity_id_in_topic = None
+        entity_type_in_topic = None
+
+        commands_needing_conv = {"/close", "/ban", "/setlang"}
+        if cmd == "/unban" and not args:
+            commands_needing_conv.add("/unban")
+
+        if cmd in commands_needing_conv:
             try:
-                await tg("sendMessage", {
-                    "chat_id": settings.SUPPORT_GROUP_ID,
-                    "message_thread_id": tid,
-                    "text": f"抱歉，您没有权限执行 {cmd} 命令。"
-                })
+                conv = await conv_service.get_conversation_by_topic(tid)
+                if not conv:
+                    admin_logger.warning(
+                        "命令执行失败：话题未关联对话",
+                        extra={"command": cmd}
+                    )
+                    await send_error_message(tid, "错误：此话题未关联对话实体，无法执行此命令。")
+                    return
+
+                entity_id_in_topic = conv.entity_id
+                entity_type_in_topic = conv.entity_type
+
+                admin_logger.info(
+                    "成功获取话题对应的对话实体",
+                    extra={
+                        "entity_type": entity_type_in_topic,
+                        "entity_id": entity_id_in_topic
+                    }
+                )
+
             except Exception as e:
-                logger.error(f"发送权限不足通知到话题 {tid} 失败: {e}")
-            return  # 如果没有权限，直接返回
+                admin_logger.error(
+                    "获取话题对应对话失败",
+                    extra={"command": cmd},
+                    exc_info=True
+                )
+                await send_error_message(tid, "处理命令失败：无法获取对话实体信息。")
+                return
 
-    logger.info(f"权限检查通过: 管理员 {sender_id_int} 在话题 {tid} 执行命令: '{text}'")
+        # 执行具体命令
+        await execute_command(
+            cmd, arg1, arg2, tid, admin_sender_id, admin_logger,
+            conv_service, conv, entity_id_in_topic, entity_type_in_topic
+        )
 
-    # --- 获取话题关联的实体和实体 ID 的辅助逻辑 ---
-    # 大部分命令需要话题关联的实体和实体 ID。
-    # /unban 在没有参数时需要话题关联的用户实体。
-    # /tag 命令已被移除
-    conv = None
-    entity_id_in_topic = None
-    entity_type_in_topic = None
+    except CommandError as e:
+        admin_logger.warning(
+            "命令执行失败",
+            extra={
+                "command": cmd,
+                "error_message": e.message
+            }
+        )
+        await send_error_message(tid, e.user_message)
 
-    # 需要话题关联对话记录的命令列表
-    commands_needing_conv_lookup = ("/close", "/ban", "/setlang")  # 移除了 /tag
+    except Exception as e:
+        admin_logger.error(
+            "命令执行异常",
+            extra={"command": cmd},
+            exc_info=True
+        )
+        await send_error_message(tid, "命令执行失败，请稍后重试。")
 
-    # 特殊处理 /unban，它可能需要参数，或者作用于当前话题关联的用户实体
-    # 如果是 /unban 且没有参数，则需要当前话题关联的用户实体
-    if cmd == "/unban" and not args:
-        commands_needing_conv_lookup = ("/unban",)  # 临时将 /unban 加入需要对话的列表，仅当无参数时
 
-    elif cmd in ("/close", "/ban", "/setlang"):  # 移除了 /tag
-        pass  # 这些命令始终需要话题关联的对话记录
+async def execute_command(cmd: str, arg1: str, arg2: str, tid: int, admin_sender_id: int,
+                          admin_logger, conv_service: ConversationService, conv,
+                          entity_id_in_topic: int, entity_type_in_topic: str):
+    """执行具体的命令逻辑"""
 
-    # 注意：用户在私聊或外部群组中发送的 /start 命令会在 private/group handler 中处理，不经过这里。
-
-    # 如果命令需要话题关联的对话记录，则进行查找
-    if cmd in commands_needing_conv_lookup:
-        try:
-            conv = await conv_service.get_conversation_by_topic(tid)
-            if not conv:
-                logger.warning(f"在话题 {tid} 中收到命令 '{text}'，但未找到关联对话。管理员: {admin_sender_id}")
-                # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-                await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                         "text": "错误：此话题未关联对话实体，无法执行此命令。"})
-                return  # 如果查找对话失败，停止处理
-            entity_id_in_topic = conv.entity_id
-            entity_type_in_topic = conv.entity_type
-            logger.debug(f"命令目标实体: 类型 {entity_type_in_topic} ID {entity_id_in_topic} (来自话题 {tid})")
-            logger.info(f"成功检索到话题 {tid} 的对话实体: 类型 {entity_type_in_topic} ID {entity_id_in_topic}")
-
-        except Exception as e:  # 捕获从 service/DB 查询中可能发生的错误
-            logger.error(f"处理命令 '{text}' 时，检索话题 {tid} 对应对话实体失败: {e}", exc_info=True)
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_thread_id": tid,
-                                     "text": "处理命令失败：无法获取对话实体信息。"})
-            return
-
-    # --- 命令处理逻辑 ---
-
-    # --- 命令处理逻辑 ---
     if cmd == "/set_password":
-        custom_id_to_set = arg1
-        new_password_to_set = arg2  # 可能是 None (如果只提供了ID)，也可能是空字符串或实际密码
+        await handle_set_password_command(
+            arg1, arg2, tid, admin_sender_id, admin_logger, conv_service
+        )
 
-        if not custom_id_to_set:
-            await tg("sendMessage", {
-                "chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                "text": "用法错误。\n设置密码: `/set_password <自定义ID> <新密码>`\n清除密码: `/set_password <自定义ID>` (密码部分留空)"
-            })
-            return
-
-        logger.info(
-            f"COMMANDS: 管理员 {sender_id_int} 尝试为ID '{custom_id_to_set}' 设置密码。提供的密码: '{'******' if new_password_to_set else '将清除密码'}'")
-
-        success, message = await conv_service.set_binding_id_password(custom_id_to_set, new_password_to_set)
-
-        reply_text = f"为自定义ID '{custom_id_to_set}' 操作密码结果：\n{message}"
-        if not success:
-            reply_text = f"❗ 操作失败：\n{message}"
-
-        await tg("sendMessage", {
-            "chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-            "text": reply_text
-        })
-        return  # /set_password 命令处理完毕
-
-    if cmd == "/close":
-        # conv, entity_id_in_topic, entity_type_in_topic 在上面已检查并保证存在
-        try:
-            # Service handles DB update and notifies entity/updates topic name
-            await conv_service.close_conversation(tid, entity_id_in_topic, entity_type_in_topic)
-            # Service notifies entity and updates topic name. Just confirm to admin.
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                     "text": f"对话已标记为关闭。关联实体: {entity_type_in_topic} ID {entity_id_in_topic}"})
-            logger.info(
-                f"话题 {tid} (实体 {entity_type_in_topic} ID {entity_id_in_topic}) 由管理员 {admin_sender_id} 关闭")
-        except Exception as e:
-            logger.error(f"执行 /close 命令失败，话题 {tid}: {e}", exc_info=True)
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage",
-                     {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid, "text": "关闭话题失败。"})
-
+    elif cmd == "/close":
+        await handle_close_command(
+            tid, admin_logger, conv_service, entity_id_in_topic, entity_type_in_topic
+        )
 
     elif cmd == "/ban":
-        # conv, entity_id_in_topic, entity_type_in_topic 在上面已检查并保证存在
-        # /ban 命令仅适用于用户实体
-        if entity_type_in_topic != 'user':
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                     "text": f"错误：/ban 命令仅适用于用户对话，此话题关联实体类型为 {entity_type_in_topic} ID {entity_id_in_topic}。"})
-            logger.warning(
-                f"管理员 {admin_sender_id} 在话题 {tid} 中对非用户实体使用 /ban 命令 (类型: {entity_type_in_topic} ID: {entity_id_in_topic}).")
-            return
-
-        try:
-            # Service handles DB update and notifies user
-            await conv_service.ban_user(entity_id_in_topic)  # ban_user 方法仍然只接受 user_id
-            # Service notifies user. Just confirm to admin.
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                     "text": f"用户 {entity_id_in_topic} 已被拉黑。"})
-            logger.info(f"用户 {entity_id_in_topic} 在话题 {tid} 中由管理员 {admin_sender_id} 拉黑")
-        except Exception as e:
-            logger.error(f"执行 /ban 命令失败，用户 {entity_id_in_topic}: {e}", exc_info=True)
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage",
-                     {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid, "text": "拉黑用户失败。"})
-
+        await handle_ban_command(
+            tid, admin_logger, conv_service, entity_id_in_topic, entity_type_in_topic
+        )
 
     elif cmd == "/unban":
-        # 新逻辑: 如果有参数，解除指定 ID 拉黑；如果没有参数，解除当前话题关联用户实体拉黑。
-        user_id_to_unban = None
-        if args:
-            # 从参数获取用户 ID
-            try:
-                user_id_to_unban = int(args[0])
-                logger.debug(f"/unban 命令指定用户 ID: {user_id_to_unban}")
-            except ValueError:
-                logger.warning(f"管理员 {admin_sender_id} 在话题 {tid} 中使用 /unban 提供了无效 ID: '{args[0]}'")
-                # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-                await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                         "text": "无效的用户 ID。用法: /unban <用户ID> 或在用户对话话题中直接使用 /unban 解除当前用户拉黑。"})
-                return  # 无效参数，停止处理
-        else:
-            # 没有参数，使用当前话题关联的用户实体 ID
-            # conv, entity_id_in_topic, entity_type_in_topic 在上面检查 commands_needing_conv_lookup 时已经获取
-            if entity_type_in_topic != 'user':
-                # 如果没有参数，但话题关联的不是用户实体，提示错误
-                # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-                await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                         "text": f"错误：/unban 命令仅适用于用户对话。此话题关联实体类型为 {entity_type_in_topic}。用法: /unban <用户ID> 或在用户对话话题中直接使用 /unban。"})
-                logger.warning(
-                    f"管理员 {admin_sender_id} 在话题 {tid} 中对非用户实体使用无参数 /unban (类型: {entity_type_in_topic}).")
-                return
-            user_id_to_unban = entity_id_in_topic
-            logger.debug(f"/unban 命令无参数，使用当前话题关联用户实体 ID: {user_id_to_unban}")
-
-        # 执行解除拉黑逻辑 (user_id_to_unban 现在确定有值，并且是用户 ID，除非上面返回了)
-        if user_id_to_unban is not None:
-            try:
-                # Service handles DB update and user notification
-                await conv_service.unban_user(user_id_to_unban)  # unban_user 方法仍然只接受 user_id
-                # Service notifies user. Just confirm to admin.
-                # 管理员反馈
-                # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-                await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                         "text": f"用户 {user_id_to_unban} 已被解除拉黑。"})
-                logger.info(f"用户 {user_id_to_unban} 由管理员 {admin_sender_id} 解除拉黑 (在话题 {tid} 执行).")
-                # 用户通知在 service.unban_user 中完成
-            except Exception as e:
-                logger.error(f"执行 /unban 命令失败，用户 {user_id_to_unban}: {e}", exc_info=True)
-                # 管理员反馈
-                # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-                await tg("sendMessage",
-                         {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid, "text": "解除拉黑失败。"})
-
-
-    # --- /tag 命令已移除 ---
-    # elif cmd == "/tag":
-    #     pass # 此分支已被移除
+        await handle_unban_command(
+            arg1, tid, admin_logger, conv_service, entity_id_in_topic, entity_type_in_topic
+        )
 
     elif cmd == "/setlang":
-        # conv, entity_id_in_topic, entity_type_in_topic 在上面已检查并保证存在
-        # /setlang 命令仅适用于用户实体
-        if entity_type_in_topic != 'user':
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                     "text": f"错误：/setlang 命令仅适用于用户对话，此话题关联实体类型为 {entity_type_in_topic} ID {entity_id_in_topic}。"})
-            logger.warning(
-                f"管理员 {admin_sender_id} 在话题 {tid} 中对非用户实体使用 /setlang 命令 (类型: {entity_type_in_topic} ID: {entity_id_in_topic}).")
-            return
-
-        if not args:
-            # 管理员反馈：没有参数
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                     "text": "用法: /setlang <语言码> (例如: en, zh-CN, fr)"})
-            logger.warning(f"管理员 {admin_sender_id} 在话题 {tid} 中使用 /setlang 未提供参数.")
-            return
-
-        try:
-            new_lang = args[0].strip()[:10].lower()  # 限制长度并转小写
-            # Service handles DB update and notifies user
-            # set_user_language 方法需要话题 ID 和用户 ID
-            await conv_service.set_user_language(tid, entity_id_in_topic, new_lang)
-            # Service notifies user. Just confirm to admin.
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                     "text": f"用户 {entity_id_in_topic} 的目标语言已更新为: {new_lang}"})
-            logger.info(
-                f"话题 {tid} (用户 {entity_id_in_topic}) 语言设置为 '{new_lang}'，由管理员 {admin_sender_id} 执行")
-        except Exception as e:
-            logger.error(f"执行 /setlang 命令失败，话题 {tid}: {e}", exc_info=True)
-            # 管理员反馈：异常时给出反馈
-            # 修正 chat_id 参数，使用 settings.SUPPORT_GROUP_ID
-            await tg("sendMessage",
-                     {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid, "text": "设置语言失败。"})
-
+        await handle_setlang_command(
+            arg1, tid, admin_logger, conv_service, entity_id_in_topic, entity_type_in_topic
+        )
 
     else:
-        # 未知命令
-        logger.warning(f"管理员 {admin_sender_id} 在话题 {tid} 中发送未知命令: '{text}' ")
-        # 管理员反馈：未知命令时给出反馈 (移除了 /tag 的用法)
-        await tg("sendMessage", {"chat_id": settings.SUPPORT_GROUP_ID, "message_thread_id": tid,
-                                 "text": "未知命令,未发送给客户。\n可用命令: /close, /ban, /unban [<用户ID>], /setlang <语言码>"})
+        admin_logger.warning(f"未知命令: {cmd}")
+        await send_error_message(
+            tid,
+            "未知命令，未发送给客户。\n可用命令: /close, /ban, /unban [<用户ID>], /setlang <语言码>, /set_password <ID> [<密码>]"
+        )
 
-# END OF FILE handlers/commands.py
+
+async def handle_set_password_command(custom_id: str, password: str, tid: int,
+                                      admin_sender_id: int, admin_logger, conv_service: ConversationService):
+    """处理设置密码命令"""
+    if not custom_id:
+        raise CommandError(
+            "用法错误：缺少自定义ID",
+            "用法错误。\n设置密码: `/set_password <自定义ID> <新密码>`\n清除密码: `/set_password <自定义ID>` (密码部分留空)"
+        )
+
+    # 验证自定义ID格式
+    if len(custom_id) < 3 or len(custom_id) > 50:
+        raise CommandError(
+            f"自定义ID长度无效: {len(custom_id)}",
+            "自定义ID长度必须为3-50个字符。"
+        )
+
+    # 验证密码（如果提供）
+    if password and len(password) > 128:
+        raise CommandError(
+            f"密码过长: {len(password)}",
+            "密码长度不能超过128个字符。"
+        )
+
+    admin_logger.info(
+        "设置自定义ID密码",
+        extra={
+            "custom_id": custom_id,
+            "has_password": password is not None,
+            "password_length": len(password) if password else 0
+        }
+    )
+
+    success, message = await conv_service.set_binding_id_password(custom_id, password)
+
+    reply_text = f"为自定义ID '{custom_id}' 操作密码结果：\n{message}"
+    if not success:
+        reply_text = f"❗ 操作失败：\n{message}"
+
+    await tg("sendMessage", {
+        "chat_id": settings.SUPPORT_GROUP_ID,
+        "message_thread_id": tid,
+        "text": reply_text
+    })
+
+
+async def handle_close_command(tid: int, admin_logger, conv_service: ConversationService,
+                               entity_id: int, entity_type: str):
+    """处理关闭对话命令"""
+    admin_logger.info(
+        "关闭对话",
+        extra={
+            "entity_type": entity_type,
+            "entity_id": entity_id
+        }
+    )
+
+    await conv_service.close_conversation(tid, entity_id, entity_type)
+
+    await tg("sendMessage", {
+        "chat_id": settings.SUPPORT_GROUP_ID,
+        "message_thread_id": tid,
+        "text": f"对话已标记为关闭。关联实体: {entity_type} ID {entity_id}"
+    })
+
+
+async def handle_ban_command(tid: int, admin_logger, conv_service: ConversationService,
+                             entity_id: int, entity_type: str):
+    """处理拉黑用户命令"""
+    if entity_type != 'user':
+        raise CommandError(
+            f"ban命令不适用于{entity_type}类型实体",
+            f"错误：/ban 命令仅适用于用户对话，此话题关联实体类型为 {entity_type} ID {entity_id}。"
+        )
+
+    admin_logger.info(
+        "拉黑用户",
+        extra={"user_id": entity_id}
+    )
+
+    await conv_service.ban_user(entity_id)
+
+    await tg("sendMessage", {
+        "chat_id": settings.SUPPORT_GROUP_ID,
+        "message_thread_id": tid,
+        "text": f"用户 {entity_id} 已被拉黑。"
+    })
+
+
+async def handle_unban_command(user_id_arg: str, tid: int, admin_logger, conv_service: ConversationService,
+                               entity_id: int, entity_type: str):
+    """处理解除拉黑命令"""
+    user_id_to_unban = None
+
+    if user_id_arg:
+        # 验证用户ID参数
+        try:
+            user_id_to_unban = int(user_id_arg)
+            admin_logger.info(f"解除指定用户拉黑: {user_id_to_unban}")
+        except ValueError:
+            raise CommandError(
+                f"无效的用户ID: {user_id_arg}",
+                "无效的用户 ID。用法: /unban <用户ID> 或在用户对话话题中直接使用 /unban。"
+            )
+    else:
+        # 使用当前话题关联的用户
+        if entity_type != 'user':
+            raise CommandError(
+                f"unban命令在{entity_type}话题中需要用户ID参数",
+                f"错误：/unban 命令仅适用于用户对话。此话题关联实体类型为 {entity_type}。用法: /unban <用户ID>。"
+            )
+        user_id_to_unban = entity_id
+        admin_logger.info(f"解除当前话题用户拉黑: {user_id_to_unban}")
+
+    success = await conv_service.unban_user(user_id_to_unban)
+
+    if success:
+        await tg("sendMessage", {
+            "chat_id": settings.SUPPORT_GROUP_ID,
+            "message_thread_id": tid,
+            "text": f"用户 {user_id_to_unban} 已被解除拉黑。"
+        })
+    else:
+        await tg("sendMessage", {
+            "chat_id": settings.SUPPORT_GROUP_ID,
+            "message_thread_id": tid,
+            "text": f"用户 {user_id_to_unban} 不在拉黑列表中或解除失败。"
+        })
+
+
+async def handle_setlang_command(lang_code: str, tid: int, admin_logger, conv_service: ConversationService,
+                                 entity_id: int, entity_type: str):
+    """处理设置语言命令"""
+    if entity_type != 'user':
+        raise CommandError(
+            f"setlang命令不适用于{entity_type}类型实体",
+            f"错误：/setlang 命令仅适用于用户对话，此话题关联实体类型为 {entity_type} ID {entity_id}。"
+        )
+
+    if not lang_code:
+        raise CommandError(
+            "setlang命令缺少语言码参数",
+            "用法: /setlang <语言码> (例如: en, zh-CN, fr)"
+        )
+
+    # 验证和清理语言码
+    lang_code = lang_code.strip()[:10].lower()
+
+    # 简单的语言码格式检查
+    import re
+    if not re.match(r'^[a-z]{2}(-[a-z]{2})?$', lang_code.lower()):
+        raise CommandError(
+            f"无效的语言码格式: {lang_code}",
+            "语言码格式无效。请使用标准格式，如: en, zh-cn, fr 等。"
+        )
+
+    admin_logger.info(
+        "设置用户语言",
+        extra={
+            "user_id": entity_id,
+            "language": lang_code
+        }
+    )
+
+    await conv_service.set_user_language(tid, entity_id, lang_code)
+
+    await tg("sendMessage", {
+        "chat_id": settings.SUPPORT_GROUP_ID,
+        "message_thread_id": tid,
+        "text": f"用户 {entity_id} 的目标语言已更新为: {lang_code}"
+    })
+
+
+async def send_error_message(tid: int, message: str):
+    """发送错误消息到话题"""
+    try:
+        await tg("sendMessage", {
+            "chat_id": settings.SUPPORT_GROUP_ID,
+            "message_thread_id": tid,
+            "text": message
+        })
+    except Exception as e:
+        logger.error(
+            "发送错误消息失败",
+            extra={
+                "topic_id": tid,
+                "error_message": message
+            },
+            exc_info=True
+        )
