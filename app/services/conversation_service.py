@@ -547,59 +547,6 @@ class ConversationService:
             self.logger.error(f"UNBAN_USER: 意外错误：解除拉黑用户 {user_id_int} 失败: {e}", exc_info=True)
             return False
 
-    @monitor_performance("set_user_language")
-    async def set_user_language(self, topic_id: int, user_id: int | str, lang_code: str):
-        """设置用户语言"""
-        try:
-            def _get_conversation():
-                return Conversation.get_or_none(
-                    (Conversation.entity_id == int(user_id)) &
-                    (Conversation.entity_type == 'user')
-                )
-
-            conv_entry: Conversation = await run_in_threadpool(_get_conversation)
-
-            if not conv_entry or conv_entry.topic_id != topic_id:
-                self.logger.warning(f"为话题 {topic_id} 设置语言时，未找到匹配的用户对话记录")
-                return
-
-            def _update_language():
-                return Conversation.update(lang=lang_code).where(
-                    (Conversation.entity_id == int(user_id)) &
-                    (Conversation.entity_type == 'user') &
-                    (Conversation.topic_id == topic_id)
-                ).execute()
-
-            updated_count = await run_in_threadpool(_update_language)
-
-            if updated_count > 0:
-                self.logger.info(f"用户 {user_id} 的目标语言设置为 '{lang_code}'")
-
-                # 使缓存失效
-                if self.cache:
-                    await self.cache.conversation_cache.invalidate_conversation(
-                        int(user_id), 'user', topic_id
-                    )
-
-                try:
-                    await self.tg("sendMessage", {
-                        "chat_id": conv_entry.entity_id,
-                        "text": f"您的客服对话语言已设置为: {lang_code}。"
-                    })
-                    record_telegram_api_call("sendMessage", 0, True)
-                except Exception as e:
-                    self.logger.warning(f"发送'语言已设置'消息失败: {e}")
-                    record_telegram_api_call("sendMessage", 0, False)
-            else:
-                self.logger.warning(f"在话题 {topic_id} 中的 /setlang 命令未能找到匹配的对话记录来更新语言")
-
-            record_database_operation("set_user_language", 0, True)
-
-        except PeeweeException as e:
-            self.logger.error(f"数据库错误：为话题 {topic_id} 设置语言失败: {e}", exc_info=True)
-            record_database_operation("set_user_language", 0, False)
-            raise
-
     @monitor_performance("reopen_conversation")
     async def reopen_conversation(self, entity_id: int | str, entity_type: str, topic_id: int):
         """重新开启对话"""
@@ -1036,10 +983,60 @@ class ConversationService:
         except Exception as e:
             self.logger.error(f"Unexpected error while recording outgoing message: {e}", exc_info=True)
 
+    @monitor_performance("create_binding_id")
+    async def create_binding_id(self, custom_id: str, password: str | None = None) -> tuple[bool, str]:
+        """创建新的绑定ID"""
+        self.logger.info(f"CREATE_BIND_ID: 尝试创建自定义ID '{custom_id}'")
+
+        if not custom_id:
+            return False, "自定义ID不能为空。"
+
+        def _create_binding_id_in_db():
+            from ..store import db as service_db
+            with service_db.atomic():
+                # 检查ID是否已存在
+                existing_entry = BindingID.get_or_none(BindingID.custom_id == custom_id)
+                if existing_entry:
+                    return False, f"自定义ID '{custom_id}' 已存在。"
+
+                # 创建新的绑定ID
+                new_binding_id = BindingID.create(
+                    custom_id=custom_id,
+                    is_used='unused'
+                )
+
+                # 设置密码（如果提供）
+                if password and password.strip():
+                    new_binding_id.set_password(password.strip())
+                    new_binding_id.save()
+                    self.logger.info(f"CREATE_BIND_ID: 已为自定义ID '{custom_id}' 设置密码")
+                    return True, f"已创建自定义ID '{custom_id}' 并设置密码。"
+                else:
+                    self.logger.info(f"CREATE_BIND_ID: 已创建自定义ID '{custom_id}' 无密码")
+                    return True, f"已创建自定义ID '{custom_id}' 无密码要求。"
+
+        try:
+            success, message = await run_in_threadpool(_create_binding_id_in_db)
+
+            # 使缓存失效
+            if self.cache:
+                await self.cache.conversation_cache.invalidate_binding_id(custom_id)
+
+            record_database_operation("create_binding_id", 0, True)
+            return success, message
+
+        except PeeweeException as e:
+            self.logger.error(f"CREATE_BIND_ID: 创建绑定ID时发生数据库错误: {e}", exc_info=True)
+            record_database_operation("create_binding_id", 0, False)
+            return False, "创建绑定ID时发生数据库错误。"
+        except Exception as e:
+            self.logger.error(f"CREATE_BIND_ID: 创建绑定ID时发生意外错误: {e}", exc_info=True)
+            return False, "创建绑定ID时发生意外错误。"
+
     @monitor_performance("set_binding_id_password")
     async def set_binding_id_password(self, custom_id: str, new_password: str | None) -> tuple[bool, str]:
-        """为指定的自定义ID设置或更新密码"""
-        self.logger.info(f"SET_BIND_PASS: 尝试为自定义ID '{custom_id}' 设置新密码")
+        """修改指定自定义ID的密码（会替换之前的密码）"""
+        self.logger.info(f"SET_BIND_PASS: 尝试修改自定义ID '{custom_id}' 的密码")
 
         if not custom_id:
             return False, "自定义ID不能为空。"
@@ -1052,11 +1049,13 @@ class ConversationService:
                     return False, f"自定义ID '{custom_id}' 不存在。"
 
                 if new_password and new_password.strip():
+                    # 设置新密码（会替换之前的密码）
                     binding_entry.set_password(new_password.strip())
                     binding_entry.save()
-                    self.logger.info(f"SET_BIND_PASS: 已为自定义ID '{custom_id}' 设置了新密码的哈希")
-                    return True, f"已为自定义ID '{custom_id}' 设置新密码。"
+                    self.logger.info(f"SET_BIND_PASS: 已为自定义ID '{custom_id}' 更新密码")
+                    return True, f"已为自定义ID '{custom_id}' 更新密码。"
                 else:
+                    # 清除密码
                     binding_entry.password_hash = None
                     binding_entry.save()
                     self.logger.info(f"SET_BIND_PASS: 已清除自定义ID '{custom_id}' 的密码")
@@ -1073,9 +1072,9 @@ class ConversationService:
             return success, message
 
         except PeeweeException as e:
-            self.logger.error(f"SET_BIND_PASS: 设置密码时发生数据库错误: {e}", exc_info=True)
+            self.logger.error(f"SET_BIND_PASS: 修改密码时发生数据库错误: {e}", exc_info=True)
             record_database_operation("set_binding_id_password", 0, False)
-            return False, "设置密码时发生数据库错误。"
+            return False, "修改密码时发生数据库错误。"
         except Exception as e:
-            self.logger.error(f"SET_BIND_PASS: 设置密码时发生意外错误: {e}", exc_info=True)
-            return False, "设置密码时发生意外错误。"
+            self.logger.error(f"SET_BIND_PASS: 修改密码时发生意外错误: {e}", exc_info=True)
+            return False, "修改密码时发生意外错误。"

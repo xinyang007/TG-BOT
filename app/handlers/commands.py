@@ -6,8 +6,8 @@ from ..validation import ValidationError
 
 logger = get_logger("app.handlers.commands")
 
-# 需要管理员权限的命令
-PRIVILEGED_COMMANDS = {"/ban", "/close", "/unban", "/set_password", "/setlang"}
+# 需要管理员权限的命令 - 移除 /setlang，新增 /create_id，保留 /set_password
+PRIVILEGED_COMMANDS = {"/ban", "/close", "/unban", "/create_id", "/set_password"}
 
 
 class CommandError(Exception):
@@ -90,7 +90,7 @@ async def handle_commands(tid: int, admin_sender_id: int | str, text: str, conv_
         entity_id_in_topic = None
         entity_type_in_topic = None
 
-        commands_needing_conv = {"/close", "/ban", "/setlang"}
+        commands_needing_conv = {"/close", "/ban"}
         if cmd == "/unban" and not args:
             commands_needing_conv.add("/unban")
 
@@ -155,7 +155,12 @@ async def execute_command(cmd: str, arg1: str, arg2: str, tid: int, admin_sender
                           entity_id_in_topic: int, entity_type_in_topic: str):
     """执行具体的命令逻辑"""
 
-    if cmd == "/set_password":
+    if cmd == "/create_id":
+        await handle_create_id_command(
+            arg1, arg2, tid, admin_sender_id, admin_logger, conv_service
+        )
+
+    elif cmd == "/set_password":
         await handle_set_password_command(
             arg1, arg2, tid, admin_sender_id, admin_logger, conv_service
         )
@@ -175,26 +180,21 @@ async def execute_command(cmd: str, arg1: str, arg2: str, tid: int, admin_sender
             arg1, tid, admin_logger, conv_service, entity_id_in_topic, entity_type_in_topic
         )
 
-    elif cmd == "/setlang":
-        await handle_setlang_command(
-            arg1, tid, admin_logger, conv_service, entity_id_in_topic, entity_type_in_topic
-        )
-
     else:
         admin_logger.warning(f"未知命令: {cmd}")
         await send_error_message(
             tid,
-            "未知命令，未发送给客户。\n可用命令: /close, /ban, /unban [<用户ID>], /setlang <语言码>, /set_password <ID> [<密码>]"
+            "未知命令，未发送给客户。\n可用命令:\n- /close: 关闭对话\n- /ban: 拉黑用户\n- /unban [<用户ID>]: 解除拉黑\n- /create_id <ID> [<密码>]: 创建新的绑定ID\n- /set_password <ID> [<新密码>]: 修改ID密码（会替换原密码）"
         )
 
 
 async def handle_set_password_command(custom_id: str, password: str, tid: int,
-                                      admin_sender_id: int, admin_logger, conv_service: ConversationService):
-    """处理设置密码命令"""
+                                   admin_sender_id: int, admin_logger, conv_service: ConversationService):
+    """处理修改密码命令"""
     if not custom_id:
         raise CommandError(
             "用法错误：缺少自定义ID",
-            "用法错误。\n设置密码: `/set_password <自定义ID> <新密码>`\n清除密码: `/set_password <自定义ID>` (密码部分留空)"
+            "用法错误。\n修改密码: `/set_password <自定义ID> <新密码>`\n清除密码: `/set_password <自定义ID>` (密码部分留空)\n\n注意：此操作会替换原有密码。"
         )
 
     # 验证自定义ID格式
@@ -212,7 +212,7 @@ async def handle_set_password_command(custom_id: str, password: str, tid: int,
         )
 
     admin_logger.info(
-        "设置自定义ID密码",
+        "修改自定义ID密码",
         extra={
             "custom_id": custom_id,
             "has_password": password is not None,
@@ -222,9 +222,54 @@ async def handle_set_password_command(custom_id: str, password: str, tid: int,
 
     success, message = await conv_service.set_binding_id_password(custom_id, password)
 
-    reply_text = f"为自定义ID '{custom_id}' 操作密码结果：\n{message}"
+    reply_text = f"修改自定义ID '{custom_id}' 密码结果：\n{message}"
     if not success:
-        reply_text = f"❗ 操作失败：\n{message}"
+        reply_text = f"❗ 修改失败：\n{message}"
+
+    await tg("sendMessage", {
+        "chat_id": settings.SUPPORT_GROUP_ID,
+        "message_thread_id": tid,
+        "text": reply_text
+    })
+
+
+async def handle_create_id_command(custom_id: str, password: str, tid: int,
+                                   admin_sender_id: int, admin_logger, conv_service: ConversationService):
+    """处理创建用户ID命令"""
+    if not custom_id:
+        raise CommandError(
+            "用法错误：缺少自定义ID",
+            "用法错误。\n创建ID: `/create_id <自定义ID> [<密码>]`\n例如: `/create_id user123` 或 `/create_id user123 password456`"
+        )
+
+    # 验证自定义ID格式
+    if len(custom_id) < 3 or len(custom_id) > 50:
+        raise CommandError(
+            f"自定义ID长度无效: {len(custom_id)}",
+            "自定义ID长度必须为3-50个字符。"
+        )
+
+    # 验证密码（如果提供）
+    if password and len(password) > 128:
+        raise CommandError(
+            f"密码过长: {len(password)}",
+            "密码长度不能超过128个字符。"
+        )
+
+    admin_logger.info(
+        "创建自定义ID",
+        extra={
+            "custom_id": custom_id,
+            "has_password": password is not None,
+            "password_length": len(password) if password else 0
+        }
+    )
+
+    success, message = await conv_service.create_binding_id(custom_id, password)
+
+    reply_text = f"创建自定义ID '{custom_id}' 结果：\n{message}"
+    if not success:
+        reply_text = f"❗ 创建失败：\n{message}"
 
     await tg("sendMessage", {
         "chat_id": settings.SUPPORT_GROUP_ID,
@@ -315,49 +360,6 @@ async def handle_unban_command(user_id_arg: str, tid: int, admin_logger, conv_se
             "message_thread_id": tid,
             "text": f"用户 {user_id_to_unban} 不在拉黑列表中或解除失败。"
         })
-
-
-async def handle_setlang_command(lang_code: str, tid: int, admin_logger, conv_service: ConversationService,
-                                 entity_id: int, entity_type: str):
-    """处理设置语言命令"""
-    if entity_type != 'user':
-        raise CommandError(
-            f"setlang命令不适用于{entity_type}类型实体",
-            f"错误：/setlang 命令仅适用于用户对话，此话题关联实体类型为 {entity_type} ID {entity_id}。"
-        )
-
-    if not lang_code:
-        raise CommandError(
-            "setlang命令缺少语言码参数",
-            "用法: /setlang <语言码> (例如: en, zh-CN, fr)"
-        )
-
-    # 验证和清理语言码
-    lang_code = lang_code.strip()[:10].lower()
-
-    # 简单的语言码格式检查
-    import re
-    if not re.match(r'^[a-z]{2}(-[a-z]{2})?$', lang_code.lower()):
-        raise CommandError(
-            f"无效的语言码格式: {lang_code}",
-            "语言码格式无效。请使用标准格式，如: en, zh-cn, fr 等。"
-        )
-
-    admin_logger.info(
-        "设置用户语言",
-        extra={
-            "user_id": entity_id,
-            "language": lang_code
-        }
-    )
-
-    await conv_service.set_user_language(tid, entity_id, lang_code)
-
-    await tg("sendMessage", {
-        "chat_id": settings.SUPPORT_GROUP_ID,
-        "message_thread_id": tid,
-        "text": f"用户 {entity_id} 的目标语言已更新为: {lang_code}"
-    })
 
 
 async def send_error_message(tid: int, message: str):
