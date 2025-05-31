@@ -3,6 +3,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Dict, Any
+from app.rate_limit_notifications import send_rate_limit_notification, send_punishment_notification
 
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -44,8 +45,11 @@ async def lifespan(app: FastAPI):
         await run_in_threadpool(create_all_tables)
         logger.info("数据库表检查/创建完成")
 
-        # 自动设置 Webhook
-        await setup_webhook()
+        try:
+            await setup_webhook()
+        except Exception as e:
+            logger.warning(f"Webhook设置失败，但应用继续运行: {e}")
+            # 应用继续运行，稍后手动设置Webhook
 
         logger.info("应用启动完成")
         yield
@@ -333,6 +337,114 @@ async def cache_stats_endpoint():
         )
 
 
+@app.get("/admin/queue/status")
+async def queue_status():
+    """获取消息队列状态"""
+    if not getattr(settings, 'ENABLE_MESSAGE_QUEUE', False):
+        return {"enabled": False, "status": "disabled"}
+
+    try:
+        from app.dependencies import get_message_queue_service
+        mq_service = await get_message_queue_service()
+
+        if mq_service:
+            stats = await mq_service.get_stats()
+            return {
+                "enabled": True,
+                "status": "running",
+                "stats": stats,
+                "timestamp": time.time()
+            }
+        else:
+            return {"enabled": True, "status": "not_initialized"}
+
+    except Exception as e:
+        return {
+            "enabled": True,
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+@app.get("/admin/rate-limit/status")
+async def rate_limit_status():
+    """获取速率限制状态"""
+    if not getattr(settings, 'ADVANCED_RATE_LIMIT_ENABLED', True):
+        return {"enabled": False, "status": "disabled"}
+
+    try:
+        from app.rate_limit import get_rate_limiter
+        limiter = await get_rate_limiter()
+        stats = await limiter.get_stats()
+
+        return {
+            "enabled": True,
+            "status": "running",
+            "stats": stats,
+            "timestamp": time.time()
+        }
+
+    except Exception as e:
+        return {
+            "enabled": True,
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+@app.post("/admin/rate-limit/whitelist/{user_id}")
+async def whitelist_user(user_id: int):
+    """将用户加入白名单1小时"""
+    try:
+        from app.rate_limit import get_rate_limiter
+        limiter = await get_rate_limiter()
+        await limiter.whitelist_user(f"user:{user_id}", 3600)
+
+        return {
+            "status": "success",
+            "message": f"用户 {user_id} 已加入白名单1小时",
+            "timestamp": time.time()
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"操作失败: {str(e)}"}
+        )
+
+
+@app.get("/admin/user/{user_id}/info")
+async def user_info(user_id: int):
+    """获取用户信息"""
+    try:
+        user_group = settings.get_user_group(user_id)
+
+        # 检查是否在白名单
+        is_whitelisted = False
+        try:
+            from app.rate_limit import get_rate_limiter
+            limiter = await get_rate_limiter()
+            is_whitelisted = await limiter.is_whitelisted(f"user:{user_id}")
+        except:
+            pass
+
+        return {
+            "user_id": user_id,
+            "user_group": user_group,
+            "is_admin": user_id in settings.ADMIN_USER_IDS,
+            "is_premium": user_id in getattr(settings, 'PREMIUM_USER_IDS', []),
+            "is_whitelisted": is_whitelisted,
+            "timestamp": time.time()
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"获取用户信息失败: {str(e)}"}
+        )
+
 # --- Webhook 端点 ---
 @app.post(f"/{settings.WEBHOOK_PATH}")
 async def webhook(
@@ -382,21 +494,51 @@ async def webhook(
         user_id = validated_message.get_user_id()
         user_name = validated_message.get_user_name()
 
-        # 用户速率限制检查
+        # 增强的速率限制检查（带通知功能）
         if user_id:
             try:
-                from app.cache import get_cache_manager  # 修复：改为绝对导入
-                from app.dependencies import RateLimitManager  # 修复：改为绝对导入
-                cache = get_cache_manager()
-                rate_limiter = RateLimitManager(cache)
+                from app.rate_limit import get_rate_limiter, ActionType
 
-                if not await rate_limiter.check_user_rate_limit(user_id):
-                    logger.warning(f"用户速率限制触发: {user_id}")
-                    # 对于Telegram webhook，仍然返回200，但记录限制事件
+                # 获取详细的速率限制信息
+                logger.info(f"🔍 检查速率限制: user_id={user_id}, chat_type={chat_type}")
+
+                # 直接调用速率限制器获取详细结果
+                limiter = await get_rate_limiter()
+                user_group = settings.get_user_group(user_id)
+                rate_result = await limiter.check_rate_limit(
+                    f"user:{user_id}", ActionType.MESSAGE, user_group
+                )
+
+                if not rate_result.allowed:
+                    logger.warning(
+                        f"🚫 速率限制触发: 用户{user_id}, 聊天类型{chat_type}, "
+                        f"当前{rate_result.current_count}/{rate_result.limit}, "
+                        f"剩余时间{int(rate_result.reset_time - time.time())}秒"
+                    )
                     metrics.counter("rate_limit_hits").increment()
+
+                    # 发送通知给用户
+                    await send_rate_limit_notification(
+                        user_id=user_id,
+                        user_name=user_name,
+                        chat_type=chat_type,
+                        chat_id=chat_id,
+                        rate_result=rate_result,
+                        msg_id=msg_id
+                    )
+
+                    # 如果有惩罚时间，也发送惩罚通知
+                    if hasattr(rate_result, 'punishment_ends_at') and rate_result.punishment_ends_at:
+                        punishment_duration = int(rate_result.punishment_ends_at - time.time())
+                        if punishment_duration > 0:
+                            await send_punishment_notification(user_id, punishment_duration)
+
                     return PlainTextResponse("rate_limited")
+                else:
+                    logger.debug(f"✅ 速率限制检查通过: user_id={user_id}")
+
             except Exception as e:
-                logger.debug(f"速率限制检查失败: {e}")
+                logger.error(f"❌ 速率限制检查失败: {e}", exc_info=True)
 
         # 使用消息相关的日志器
         msg_logger = get_message_logger(
@@ -415,19 +557,22 @@ async def webhook(
             }
         )
 
-        # 根据聊天类型分发处理
+        # 直接同步处理消息（不使用队列）
         try:
             if chat_type == "private":
                 await private.handle_private(msg_data, conv_service)
                 record_message_processing("private", time.time() - start_time, True)
+                msg_logger.info("私聊消息处理完成")
             elif chat_type in ("group", "supergroup"):
                 if str(chat_id) == settings.SUPPORT_GROUP_ID:
                     await group.handle_group(msg_data, conv_service)
                     record_message_processing("support_group", time.time() - start_time, True)
+                    msg_logger.info("客服群组消息处理完成")
                 else:
                     msg_logger.info("处理外部群组消息")
                     await group.handle_group(msg_data, conv_service)
                     record_message_processing("external_group", time.time() - start_time, True)
+                    msg_logger.info("外部群组消息处理完成")
             else:
                 msg_logger.debug(f"忽略未处理的聊天类型: {chat_type}")
                 return PlainTextResponse("unsupported_chat_type")
@@ -441,14 +586,12 @@ async def webhook(
             )
             record_message_processing(chat_type or "unknown", time.time() - start_time, False)
             metrics.counter("message_processing_errors").increment()
-            # 仍然返回200给Telegram，避免重试
             return PlainTextResponse("processing_error")
 
         msg_logger.info("消息处理完成")
         return PlainTextResponse("ok")
 
     except Exception as e:
-        # 这个异常会被中间件捕获，但我们在这里也记录一下
         logger.error(
             "Webhook处理异常",
             extra={
@@ -458,7 +601,6 @@ async def webhook(
             },
             exc_info=True
         )
-        # 重新抛出让中间件处理
         raise
 
 

@@ -280,6 +280,31 @@ class ApplicationLifecycleManager:
             # 4. 初始化服务
             service_manager = get_service_manager()
             # 服务将在首次使用时初始化
+            # 4. 检查新功能配置
+            self.logger.info(f"消息队列启用状态: {getattr(settings, 'ENABLE_MESSAGE_QUEUE', False)}")
+            self.logger.info(f"Redis URL: {getattr(settings, 'REDIS_URL', 'Not set')}")
+            self.logger.info(f"高级速率限制启用状态: {getattr(settings, 'ADVANCED_RATE_LIMIT_ENABLED', True)}")
+            self.logger.info(f"高级用户数量: {len(getattr(settings, 'PREMIUM_USER_IDS', []))}")
+
+            # 5. 测试速率限制器初始化
+            try:
+                from app.rate_limit import get_rate_limiter
+                rate_limiter = await get_rate_limiter()
+                self.logger.info("✅ 高级速率限制器初始化成功")
+            except Exception as e:
+                self.logger.warning(f"⚠️ 高级速率限制器初始化失败: {e}")
+
+            # 6. 测试消息队列初始化（如果启用）
+            if getattr(settings, 'ENABLE_MESSAGE_QUEUE', False):
+                try:
+                    from app.dependencies import get_message_queue_service
+                    mq_service = await get_message_queue_service()
+                    if mq_service:
+                        self.logger.info("✅ 消息队列服务初始化成功")
+                    else:
+                        self.logger.warning("⚠️ 消息队列服务未初始化")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 消息队列服务初始化失败: {e}")
 
             self._initialized = True
             self.logger.info("Application initialization completed")
@@ -287,6 +312,7 @@ class ApplicationLifecycleManager:
         except Exception as e:
             self.logger.error("Application initialization failed", exc_info=True)
             raise
+
 
     async def shutdown(self):
         """应用关闭时的清理"""
@@ -424,3 +450,53 @@ class HealthChecker:
 async def get_health_checker() -> HealthChecker:
     """FastAPI依赖：获取健康检查器"""
     return HealthChecker()
+
+
+# === 消息队列依赖 ===
+_message_queue_service = None
+
+
+# async def get_message_queue_service():
+#     """获取消息队列服务"""
+#     global _message_queue_service
+#     if _message_queue_service is None and getattr(settings, 'ENABLE_MESSAGE_QUEUE', False):
+#         try:
+#             from app.message_handlers import MessageQueueService
+#             from app.services.conversation_service import ConversationService
+
+#             # 简化初始化
+#             conv_service = ConversationService(
+#                 support_group_id=settings.SUPPORT_GROUP_ID,
+#                 external_group_ids=settings.EXTERNAL_GROUP_IDS,
+#                 tg_func=tg
+#             )
+#             _message_queue_service = MessageQueueService(conv_service)
+#             logger.info("Message queue service initialized")
+#         except Exception as e:
+#             logger.error(f"Failed to initialize message queue service: {e}")
+
+#     return _message_queue_service
+
+
+# === 高级速率限制依赖 ===
+async def check_advanced_rate_limit(user_id: int, action_type: str = "message") -> bool:
+    """检查高级速率限制"""
+    if not getattr(settings, 'ADVANCED_RATE_LIMIT_ENABLED', True):
+        return True
+
+    try:
+        from app.rate_limit import check_user_rate_limit, ActionType
+
+        # 转换操作类型
+        action_enum = ActionType.MESSAGE if action_type == "message" else ActionType.API_CALL
+
+        # 获取用户组
+        user_group = settings.get_user_group(user_id)
+
+        # 检查速率限制
+        result = await check_user_rate_limit(user_id, action_enum, user_group)
+        return result.allowed
+
+    except Exception as e:
+        logger.error(f"Advanced rate limit check failed: {e}")
+        return True  # 失败时允许通过

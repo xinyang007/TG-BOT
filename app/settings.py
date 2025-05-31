@@ -180,6 +180,50 @@ class Settings(BaseSettings):
         ge=10,
         le=3600
     )
+    # --- 消息队列配置 ---
+    ENABLE_MESSAGE_QUEUE: bool = Field(
+        default=False,
+        description="启用消息队列（需要Redis）"
+    )
+    REDIS_URL: str = Field(
+        default="redis://localhost:6379",
+        description="Redis连接URL"
+    )
+
+    # --- 高级速率限制配置 ---
+    ADVANCED_RATE_LIMIT_ENABLED: bool = Field(
+        default=True,
+        description="启用高级速率限制"
+    )
+
+    # --- 用户分组配置 ---
+    PREMIUM_USER_IDS: List[int] = Field(
+        default=[],
+        description="高级用户 Telegram User ID 列表"
+    )
+
+    # --- 速率限制通知配置 ---
+    ENABLE_RATE_LIMIT_NOTIFICATIONS: bool = Field(
+        default=True,
+        description="启用速率限制通知"
+    )
+    RATE_LIMIT_NOTIFICATION_LANGUAGE: str = Field(
+        default="zh",
+        description="通知语言 (zh=中文, en=英文)"
+    )
+
+    # 群聊限制时是否同时私信用户详细信息
+    ALSO_NOTIFY_USER_PRIVATELY: bool = Field(
+        default=False,
+        description="群聊触发限制时是否同时私信用户详细信息（除了在群里通知）"
+    )
+
+    RATE_LIMIT_NOTIFICATION_COOLDOWN: int = Field(
+        default=60,
+        description="同一用户在同一聊天中的通知冷却时间（秒），防止通知刷屏",
+        ge=10,
+        le=300
+    )
 
     # --- 验证器 ---
     @validator('EXTERNAL_GROUP_IDS', pre=True)
@@ -301,6 +345,15 @@ class Settings(BaseSettings):
         else:
             raise ValueError(f"不支持的数据库类型: {self.DB_KIND}")
 
+    def get_user_group(self, user_id: int) -> str:
+        """获取用户组"""
+        if user_id in self.ADMIN_USER_IDS:
+            return "admin"
+        elif user_id in getattr(self, 'PREMIUM_USER_IDS', []):
+            return "premium"
+        else:
+            return "normal"
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -342,3 +395,4 @@ def validate_settings_on_import():
 
 # 执行导入时验证
 validate_settings_on_import()
+
