@@ -352,7 +352,11 @@ async def handle_group(msg: dict, conv_service: ConversationService):
                     dest_chat_id=settings.SUPPORT_GROUP_ID,
                     message_thread_id=group_conv.topic_id,
                     sender_name=f"🏠{group_name_for_prefix} | 👤{sender_name_for_prefix}",
-                    msg=msg
+                    msg=msg,
+                    conversation_service=conv_service,  # 添加这个参数
+                    entity_id=chat_id,  # 添加这个参数
+                    entity_type='user',  # 添加这个参数
+                    entity_name=group_name_for_prefix   # 添加这个参数
                 )
                 logger.info(f"成功复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id}")
             except Exception as e:

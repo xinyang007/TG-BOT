@@ -129,8 +129,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
             try:
                 await tg("sendMessage", {
                     "chat_id": uid,
-                    "text": message_text,
-                    "parse_mode": "Markdown"
+                    "text": message_text
                 })
             except Exception as e:
                 user_logger.error("发送绑定引导消息失败", exc_info=True)
@@ -174,13 +173,22 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 extra={"validation_error": e.message}
             )
             try:
+                # 修复：使用更安全的消息格式，避免 Markdown 解析错误
+                error_text = (
+                    f"绑定格式错误：{e.message}\n\n"
+                    f"请使用正确格式：\n"
+                    f"/bind <自定义ID> [密码]\n\n"
+                    f"例如：\n"
+                    f"/bind myID123\n"
+                    f"/bind myID123 myPassword"
+                )
                 await tg("sendMessage", {
                     "chat_id": uid,
-                    "text": f"绑定格式错误：{e.message}\n请使用正确格式：`/bind <自定义ID> [密码]`",
-                    "parse_mode": "Markdown"
+                    "text": error_text
+                    # 移除 parse_mode 避免格式解析错误
                 })
-            except Exception:
-                pass
+            except Exception as send_error:
+                user_logger.error("发送绑定错误消息失败", exc_info=True)
         except Exception as e:
             user_logger.error("绑定过程异常", exc_info=True)
             try:
@@ -325,7 +333,11 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                     dest_chat_id=settings.SUPPORT_GROUP_ID,
                     message_thread_id=conv.topic_id,
                     sender_name=user_first_name,
-                    msg=msg
+                    msg=msg,
+                    conversation_service=conv_service,  # 添加这个参数
+                    entity_id=uid,  # 添加这个参数
+                    entity_type='user',  # 添加这个参数
+                    entity_name=user_first_name  # 添加这个参数
                 )
                 user_logger.info(
                     "消息转发成功",

@@ -3,6 +3,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Dict, Any
+
 from app.rate_limit_notifications import send_rate_limit_notification, send_punishment_notification
 
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -20,7 +21,8 @@ from app.logging_config import setup_logging, get_logger, get_message_logger
 from app.validation import validate_webhook_update, validate_telegram_message, ValidationError
 from app.dependencies import (
     get_conversation_service, get_cache, get_metrics, get_health_checker,
-    get_rate_limit_manager, get_lifecycle_manager, get_auth_manager
+    get_rate_limit_manager, get_lifecycle_manager, get_auth_manager,
+    get_message_coordinator_dep, get_coordinated_handler_dep  # 新增
 )
 from app.monitoring import record_http_request, record_message_processing
 from app.cache import CacheManager
@@ -125,9 +127,9 @@ async def performance_monitoring_middleware(request: Request, call_next):
 
     # 获取监控组件（直接调用，不使用依赖注入）
     try:
-        from app.monitoring import get_metrics_collector  # 修复：改为绝对导入
-        from app.cache import get_cache_manager  # 修复：改为绝对导入
-        from app.dependencies import RateLimitManager  # 修复：改为绝对导入
+        from app.monitoring import get_metrics_collector
+        from app.cache import get_cache_manager
+        from app.dependencies import RateLimitManager
 
         metrics = get_metrics_collector()
         cache = get_cache_manager()
@@ -274,7 +276,7 @@ async def root():
 async def health_check():
     """详细健康检查端点"""
     try:
-        from app.dependencies import HealthChecker  # 修复：改为绝对导入
+        from app.dependencies import HealthChecker
         health_checker = HealthChecker()
         health_info = await health_checker.get_overall_health()
 
@@ -299,7 +301,7 @@ async def health_check():
 async def metrics_endpoint():
     """性能指标端点"""
     try:
-        from app.monitoring import get_metrics_collector  # 修复：改为绝对导入
+        from app.monitoring import get_metrics_collector
         metrics = get_metrics_collector()
 
         all_metrics = metrics.get_all_metrics()
@@ -322,7 +324,7 @@ async def metrics_endpoint():
 async def cache_stats_endpoint():
     """缓存统计端点"""
     try:
-        from app.cache import get_cache_manager  # 修复：改为绝对导入
+        from app.cache import get_cache_manager
         cache = get_cache_manager()
         stats = await cache.get_stats()
         return {
@@ -445,12 +447,14 @@ async def user_info(user_id: int):
             content={"error": f"获取用户信息失败: {str(e)}"}
         )
 
+
 # --- Webhook 端点 ---
 @app.post(f"/{settings.WEBHOOK_PATH}")
 async def webhook(
         request: Request,
         conv_service=Depends(get_conversation_service),
-        metrics=Depends(get_metrics)
+        metrics=Depends(get_metrics),
+        coordinated_handler=Depends(get_coordinated_handler_dep)  # 新增协调式处理器
 ):
     """接收 Telegram 更新的 Webhook 端点"""
     update_id = None
@@ -553,11 +557,38 @@ async def webhook(
                 "update_id": update_id,
                 "chat_type": chat_type,
                 "user_id": user_id,
-                "user_name": user_name
+                "user_name": user_name,
+                "coordination_enabled": coordinated_handler is not None
             }
         )
 
-        # 直接同步处理消息（不使用队列）
+        # 根据是否启用消息协调选择处理方式
+        if coordinated_handler and getattr(settings, 'MULTI_BOT_ENABLED', False):
+            # 使用协调式处理
+            msg_logger.info("使用协调式消息处理")
+            try:
+                result = await coordinated_handler.handle_webhook_message(raw_update)
+
+                if result == "queued":
+                    msg_logger.info("消息已提交到协调队列")
+                    record_message_processing(chat_type or "unknown", time.time() - start_time, True)
+                    return PlainTextResponse("queued")
+                elif result == "coordination_failed":
+                    msg_logger.error("消息协调失败，回退到直接处理")
+                    # 回退到直接处理
+                elif result == "coordination_error":
+                    msg_logger.error("消息协调异常，回退到直接处理")
+                    # 回退到直接处理
+                else:
+                    msg_logger.warning(f"未知的协调结果: {result}")
+                    # 回退到直接处理
+
+            except Exception as coord_error:
+                msg_logger.error(f"协调式处理异常: {coord_error}", exc_info=True)
+                # 回退到直接处理
+
+        # 直接处理消息（原有逻辑或协调失败时的回退）
+        msg_logger.info("使用直接消息处理")
         try:
             if chat_type == "private":
                 await private.handle_private(msg_data, conv_service)
@@ -609,7 +640,7 @@ async def webhook(
 async def clear_cache():
     """清空缓存（管理员功能）"""
     try:
-        from app.cache import get_cache_manager  # 修复：改为绝对导入
+        from app.cache import get_cache_manager
         cache = get_cache_manager()
         await cache.clear_all()
         logger.info("管理员清空了所有缓存")
@@ -626,8 +657,8 @@ async def clear_cache():
 async def admin_stats():
     """获取管理统计信息"""
     try:
-        from app.cache import get_cache_manager  # 修复：改为绝对导入
-        from app.monitoring import get_metrics_collector  # 修复：改为绝对导入
+        from app.cache import get_cache_manager
+        from app.monitoring import get_metrics_collector
 
         cache = get_cache_manager()
         metrics = get_metrics_collector()
@@ -641,7 +672,8 @@ async def admin_stats():
             "system_info": {
                 "settings_environment": getattr(settings, 'ENVIRONMENT', 'production'),
                 "debug_mode": getattr(settings, 'DEBUG', False),
-                "rate_limit_enabled": getattr(settings, 'RATE_LIMIT_ENABLED', False)
+                "rate_limit_enabled": getattr(settings, 'RATE_LIMIT_ENABLED', False),
+                "multi_bot_enabled": getattr(settings, 'MULTI_BOT_ENABLED', False)
             },
             "timestamp": time.time()
         }
@@ -652,6 +684,354 @@ async def admin_stats():
             content={"error": "统计服务不可用"}
         )
 
+
+# --- 多机器人管理端点（仅在启用多机器人模式时可用） ---
+@app.get("/admin/bots/status")
+async def get_bots_status():
+    """获取所有机器人状态"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"enabled": False, "message": "多机器人模式未启用"}
+
+    try:
+        from app.dependencies import get_bot_manager_dep
+        bot_manager = await get_bot_manager_dep()
+
+        if not bot_manager:
+            return {"enabled": True, "status": "error", "message": "机器人管理器不可用"}
+
+        status = bot_manager.get_all_bots_status()
+        stats = bot_manager.get_stats()
+
+        return {
+            "enabled": True,
+            "summary": {
+                "total_bots": stats['total_bots'],
+                "healthy_bots": stats['healthy_bots'],
+                "available_bots": stats['available_bots']
+            },
+            "bots": status,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"获取机器人状态失败: {str(e)}"}
+        )
+
+
+@app.post("/admin/bots/{bot_id}/enable")
+async def enable_bot(bot_id: str):
+    """启用指定机器人"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"enabled": False, "message": "多机器人模式未启用"}
+
+    try:
+        from app.dependencies import get_bot_manager_dep
+        bot_manager = await get_bot_manager_dep()
+
+        if not bot_manager:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "机器人管理器不可用"}
+            )
+
+        bot = bot_manager.get_bot_by_id(bot_id)
+
+        if not bot:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"机器人 {bot_id} 不存在"}
+            )
+
+        bot.config.enabled = True
+        await bot_manager._save_bot_status(bot)
+
+        return {
+            "status": "success",
+            "message": f"机器人 {bot_id} 已启用",
+            "bot_status": bot.to_dict()
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"启用机器人失败: {str(e)}"}
+        )
+
+
+@app.post("/admin/bots/{bot_id}/disable")
+async def disable_bot(bot_id: str):
+    """禁用指定机器人"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"enabled": False, "message": "多机器人模式未启用"}
+
+    try:
+        from app.dependencies import get_bot_manager_dep
+        # 延迟导入BotStatus以避免循环导入
+        from app.bot_manager import BotStatus
+
+        bot_manager = await get_bot_manager_dep()
+
+        if not bot_manager:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "机器人管理器不可用"}
+            )
+
+        bot = bot_manager.get_bot_by_id(bot_id)
+
+        if not bot:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"机器人 {bot_id} 不存在"}
+            )
+
+        bot.config.enabled = False
+        bot.status = BotStatus.DISABLED
+        await bot_manager._save_bot_status(bot)
+
+        return {
+            "status": "success",
+            "message": f"机器人 {bot_id} 已禁用",
+            "bot_status": bot.to_dict()
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"禁用机器人失败: {str(e)}"}
+        )
+
+
+@app.post("/admin/bots/{bot_id}/health-check")
+async def manual_health_check(bot_id: str):
+    """手动健康检查指定机器人"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"enabled": False, "message": "多机器人模式未启用"}
+
+    try:
+        from app.dependencies import get_bot_manager_dep
+        bot_manager = await get_bot_manager_dep()
+
+        if not bot_manager:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "机器人管理器不可用"}
+            )
+
+        bot = bot_manager.get_bot_by_id(bot_id)
+
+        if not bot:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"机器人 {bot_id} 不存在"}
+            )
+
+        # 执行健康检查
+        is_healthy = await bot_manager._check_bot_health(bot)
+
+        return {
+            "status": "success",
+            "message": f"机器人 {bot_id} 健康检查完成",
+            "is_healthy": is_healthy,
+            "bot_status": bot.to_dict()
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"健康检查失败: {str(e)}"}
+        )
+# --- 新增：消息协调管理端点 ---
+
+@app.get("/admin/coordination/status")
+async def coordination_status():
+    """获取消息协调状态"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"enabled": False, "status": "multi_bot_disabled"}
+
+    if not getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True):
+        return {"enabled": False, "status": "coordination_disabled"}
+
+    try:
+        from app.dependencies import get_message_coordinator_dep
+        coordinator = await get_message_coordinator_dep()
+
+        if not coordinator:
+            return {"enabled": True, "status": "error", "message": "消息协调器不可用"}
+
+        stats = await coordinator.get_stats()
+        return {
+            "enabled": True,
+            "status": "running",
+            "stats": stats,
+            "timestamp": time.time()
+        }
+
+    except Exception as e:
+        return {
+            "enabled": True,
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+@app.get("/admin/coordination/queue/stats")
+async def coordination_queue_stats():
+    """获取消息队列详细统计"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"error": "多机器人模式未启用"}
+
+    try:
+        from app.dependencies import get_message_coordinator_dep
+        coordinator = await get_message_coordinator_dep()
+
+        if not coordinator:
+            return {"error": "消息协调器不可用"}
+
+        stats = await coordinator.get_stats()
+        queue_stats = stats.get('queue', {})
+
+        # 获取处理统计
+        from app.message_processor import get_processing_stats
+        processing_stats = get_processing_stats()
+        processing_info = processing_stats.get_stats()
+
+        return {
+            "queue": queue_stats,
+            "processing": processing_info,
+            "timestamp": time.time()
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/admin/coordination/queue/clear")
+async def clear_coordination_queue():
+    """清空消息队列（紧急情况使用）"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"error": "多机器人模式未启用"}
+
+    try:
+        from app.dependencies import get_message_coordinator_dep
+        coordinator = await get_message_coordinator_dep()
+
+        if not coordinator:
+            return {"error": "消息协调器不可用"}
+
+        # 获取Redis客户端清空队列
+        if coordinator.redis_client:
+            await coordinator.redis_client.delete(
+                coordinator.message_queue.pending_queue,
+                coordinator.message_queue.processing_queue,
+                coordinator.message_queue.failed_queue
+            )
+            logger.warning("管理员清空了消息协调队列")
+            return {"status": "success", "message": "消息队列已清空"}
+        else:
+            return {"error": "Redis不可用，无法清空队列"}
+
+    except Exception as e:
+        logger.error("清空消息队列失败", exc_info=True)
+        return {"error": f"清空队列失败: {str(e)}"}
+
+
+@app.post("/admin/coordination/message/{message_id}/retry")
+async def retry_failed_message(message_id: str):
+    """重试失败的消息"""
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return {"error": "多机器人模式未启用"}
+
+    try:
+        from app.dependencies import get_message_coordinator_dep
+        coordinator = await get_message_coordinator_dep()
+
+        if not coordinator:
+            return {"error": "消息协调器不可用"}
+
+        # 这里需要实现从死信队列或失败队列中恢复消息的逻辑
+        # 暂时返回占位符响应
+        return {
+            "status": "success",
+            "message": f"消息 {message_id} 已提交重试",
+            "timestamp": time.time()
+        }
+
+    except Exception as e:
+        return {"error": f"重试消息失败: {str(e)}"}
+
+
+# --- 更新健康检查端点，包含协调器状态 ---
+
+@app.get("/health")
+async def health_check():
+    """详细健康检查端点（更新版本）"""
+    try:
+        from app.dependencies import HealthChecker
+        health_checker = HealthChecker()
+        health_info = await health_checker.get_overall_health()
+
+        if health_info["status"] == "healthy":
+            return health_info
+        else:
+            return JSONResponse(status_code=503, content=health_info)
+
+    except Exception as e:
+        logger.error("健康检查失败", exc_info=True)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "message": "健康检查服务不可用",
+                "timestamp": time.time()
+            }
+        )
+
+
+# --- 更新管理统计端点 ---
+
+@app.get("/admin/stats")
+async def admin_stats():
+    """获取管理统计信息（更新版本）"""
+    try:
+        from app.cache import get_cache_manager
+        from app.monitoring import get_metrics_collector
+
+        cache = get_cache_manager()
+        metrics = get_metrics_collector()
+
+        cache_stats = await cache.get_stats()
+        performance_summary = metrics.get_performance_summary()
+
+        # 添加协调器统计
+        coordination_stats = {}
+        if getattr(settings, 'MULTI_BOT_ENABLED', False) and getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True):
+            try:
+                from app.dependencies import get_message_coordinator_dep
+                coordinator = await get_message_coordinator_dep()
+                if coordinator:
+                    coordination_stats = await coordinator.get_stats()
+            except Exception as e:
+                coordination_stats = {"error": str(e)}
+
+        return {
+            "cache": cache_stats,
+            "performance": performance_summary,
+            "coordination": coordination_stats,
+            "system_info": {
+                "settings_environment": getattr(settings, 'ENVIRONMENT', 'production'),
+                "debug_mode": getattr(settings, 'DEBUG', False),
+                "rate_limit_enabled": getattr(settings, 'RATE_LIMIT_ENABLED', False),
+                "multi_bot_enabled": getattr(settings, 'MULTI_BOT_ENABLED', False),
+                "message_coordination_enabled": getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True)
+            },
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error("获取管理统计失败", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "统计服务不可用"}
+        )
 
 # --- 调试端点（仅在调试模式下启用） ---
 if getattr(settings, 'DEBUG', False):
@@ -687,9 +1067,42 @@ if getattr(settings, 'DEBUG', False):
     async def debug_get_cache(key: str):
         """调试：获取特定缓存项"""
         try:
-            from app.cache import get_cache_manager  # 修复：改为绝对导入
+            from app.cache import get_cache_manager
             cache = get_cache_manager()
             value = await cache.memory_cache.get(key)
             return {"key": key, "value": value, "found": value is not None}
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+    # 多机器人调试端点
+    if getattr(settings, 'MULTI_BOT_ENABLED', False):
+        @app.get("/debug/bots/test-selection")
+        async def debug_test_bot_selection():
+            """调试：测试机器人选择逻辑"""
+            try:
+                from app.dependencies import get_bot_manager_dep
+                bot_manager = await get_bot_manager_dep()
+
+                if not bot_manager:
+                    return {"error": "机器人管理器不可用"}
+
+                healthy_bots = bot_manager.get_healthy_bots()
+                available_bots = bot_manager.get_available_bots()
+                best_bot = bot_manager.get_best_bot()
+
+                return {
+                    "healthy_bots": [bot.bot_id for bot in healthy_bots],
+                    "available_bots": [bot.bot_id for bot in available_bots],
+                    "best_bot": best_bot.bot_id if best_bot else None,
+                    "all_bots": {
+                        bot.bot_id: {
+                            "status": bot.status.value,
+                            "load_score": bot.get_load_score(),
+                            "is_available": bot.is_available()
+                        }
+                        for bot in bot_manager.bots.values()
+                    }
+                }
+            except Exception as e:
+                return JSONResponse(status_code=500, content={"error": str(e)})

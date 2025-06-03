@@ -243,17 +243,17 @@ async def handle_create_id_command(custom_id: str, password: str, tid: int,
         )
 
     # 验证自定义ID格式
-    if len(custom_id) < 3 or len(custom_id) > 50:
+    if len(custom_id) < 4 or len(custom_id) > 50:
         raise CommandError(
             f"自定义ID长度无效: {len(custom_id)}",
-            "自定义ID长度必须为3-50个字符。"
+            "自定义ID长度必须为4-50个字符。"
         )
 
     # 验证密码（如果提供）
-    if password and len(password) > 128:
+    if password and not (4 < len(password) < 128):
         raise CommandError(
-            f"密码过长: {len(password)}",
-            "密码长度不能超过128个字符。"
+            f"密码长度不符合要求: {len(password)}",
+            "密码长度必须在4到128个字符之间。"
         )
 
     admin_logger.info(

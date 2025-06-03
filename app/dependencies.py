@@ -7,12 +7,12 @@ from fastapi import Depends, HTTPException, status
 from starlette.concurrency import run_in_threadpool
 
 from app.settings import settings
-from app.store import db, connect_db, close_db, Conversation  # 修复：改为绝对导入
-from app.tg_utils import tg  # 修复：改为绝对导入
-from app.services.conversation_service import ConversationService  # 修复：改为绝对导入
-from app.cache import CacheManager, get_cache_manager  # 修复：改为绝对导入
-from app.monitoring import MetricsCollector, get_metrics_collector  # 修复：改为绝对导入
-from app.logging_config import get_logger  # 修复：改为绝对导入
+from app.store import db, connect_db, close_db, Conversation
+from app.tg_utils import tg
+from app.services.conversation_service import ConversationService
+from app.cache import CacheManager, get_cache_manager
+from app.monitoring import MetricsCollector, get_metrics_collector
+from app.logging_config import get_logger
 
 logger = get_logger("app.dependencies")
 
@@ -96,6 +96,42 @@ async def get_metrics() -> MetricsCollector:
     return get_metrics_collector()
 
 
+# === 机器人管理依赖 ===
+
+# 全局机器人管理器引用
+_bot_manager_instance: Optional = None
+
+
+async def get_bot_manager_dep():
+    """FastAPI依赖：获取机器人管理器"""
+    global _bot_manager_instance
+
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return None
+
+    if _bot_manager_instance is None:
+        try:
+            from app.bot_manager import get_bot_manager
+            _bot_manager_instance = await get_bot_manager()
+        except Exception as e:
+            logger.error(f"获取机器人管理器失败: {e}", exc_info=True)
+            return None
+
+    return _bot_manager_instance
+
+
+async def cleanup_bot_manager_dep():
+    """清理机器人管理器依赖"""
+    global _bot_manager_instance
+    if _bot_manager_instance:
+        try:
+            from app.bot_manager import cleanup_bot_manager
+            await cleanup_bot_manager()
+            _bot_manager_instance = None
+        except Exception as e:
+            logger.error(f"清理机器人管理器失败: {e}", exc_info=True)
+
+
 # === 服务依赖 ===
 
 class ServiceManager:
@@ -118,7 +154,9 @@ class ServiceManager:
                 self._conversation_service = ConversationService(
                     support_group_id=settings.SUPPORT_GROUP_ID,
                     external_group_ids=settings.EXTERNAL_GROUP_IDS,
-                    tg_func=tg
+                    tg_func=tg,
+                    cache_manager=cache,
+                    metrics_collector=metrics
                 )
                 self.logger.info("ConversationService initialized")
             except Exception as e:
@@ -277,16 +315,34 @@ class ApplicationLifecycleManager:
             if hasattr(metrics, 'start_background_tasks'):
                 metrics.start_background_tasks()
 
-            # 4. 初始化服务
+            # 4. 初始化机器人管理器（如果启用）
+            if getattr(settings, 'MULTI_BOT_ENABLED', False):
+                try:
+                    bot_manager = await get_bot_manager_dep()
+                    if bot_manager:
+                        self.logger.info("✅ 多机器人管理器初始化成功")
+
+                        # 记录机器人状态
+                        stats = bot_manager.get_stats()
+                        self.logger.info(f"机器人统计: {stats['healthy_bots']}/{stats['total_bots']} 健康")
+                    else:
+                        self.logger.warning("⚠️ 多机器人管理器初始化失败")
+                except Exception as e:
+                    self.logger.error(f"❌ 多机器人管理器初始化异常: {e}", exc_info=True)
+            else:
+                self.logger.info("ℹ️ 单机器人模式，跳过机器人管理器初始化")
+
+            # 5. 初始化服务
             service_manager = get_service_manager()
             # 服务将在首次使用时初始化
-            # 4. 检查新功能配置
+
+            # 6. 检查其他功能配置
             self.logger.info(f"消息队列启用状态: {getattr(settings, 'ENABLE_MESSAGE_QUEUE', False)}")
             self.logger.info(f"Redis URL: {getattr(settings, 'REDIS_URL', 'Not set')}")
             self.logger.info(f"高级速率限制启用状态: {getattr(settings, 'ADVANCED_RATE_LIMIT_ENABLED', True)}")
             self.logger.info(f"高级用户数量: {len(getattr(settings, 'PREMIUM_USER_IDS', []))}")
 
-            # 5. 测试速率限制器初始化
+            # 7. 测试速率限制器初始化
             try:
                 from app.rate_limit import get_rate_limiter
                 rate_limiter = await get_rate_limiter()
@@ -294,15 +350,11 @@ class ApplicationLifecycleManager:
             except Exception as e:
                 self.logger.warning(f"⚠️ 高级速率限制器初始化失败: {e}")
 
-            # 6. 测试消息队列初始化（如果启用）
+            # 8. 测试消息队列初始化（如果启用）
             if getattr(settings, 'ENABLE_MESSAGE_QUEUE', False):
                 try:
-                    from app.dependencies import get_message_queue_service
-                    mq_service = await get_message_queue_service()
-                    if mq_service:
-                        self.logger.info("✅ 消息队列服务初始化成功")
-                    else:
-                        self.logger.warning("⚠️ 消息队列服务未初始化")
+                    # 这里可以添加消息队列服务的初始化
+                    self.logger.info("✅ 消息队列服务配置检查完成")
                 except Exception as e:
                     self.logger.warning(f"⚠️ 消息队列服务初始化失败: {e}")
 
@@ -313,7 +365,6 @@ class ApplicationLifecycleManager:
             self.logger.error("Application initialization failed", exc_info=True)
             raise
 
-
     async def shutdown(self):
         """应用关闭时的清理"""
         if not self._initialized:
@@ -322,21 +373,24 @@ class ApplicationLifecycleManager:
         try:
             self.logger.info("Starting application shutdown...")
 
-            # 1. 清理服务
+            # 1. 清理机器人管理器
+            await cleanup_bot_manager_dep()
+
+            # 2. 清理服务
             service_manager = get_service_manager()
             await service_manager.cleanup()
 
-            # 2. 停止监控
+            # 3. 停止监控
             metrics = get_metrics_collector()
             if hasattr(metrics, 'stop_background_tasks'):
                 await metrics.stop_background_tasks()
 
-            # 3. 清理缓存
+            # 4. 清理缓存
             cache_manager = get_cache_manager()
             if hasattr(cache_manager, 'stop_cleanup_task'):
                 await cache_manager.stop_cleanup_task()
 
-            # 4. 关闭数据库
+            # 5. 关闭数据库
             db_manager = get_database_manager()
             await db_manager.close()
 
@@ -370,13 +424,6 @@ class HealthChecker:
     async def check_database_health(self) -> dict:
         """检查数据库健康状态"""
         try:
-            # 修复：使用文件顶部已导入的 db 和 Conversation
-
-            # # 检查数据库连接状态
-            # if not db or db.is_closed():
-            #     return {"status": "unhealthy", "details": "Database connection is closed"}
-
-            # 执行一个简单的查询来验证连接是否真正可用
             def _test_database():
                 try:
                     # 首先尝试简单的查询
@@ -428,12 +475,37 @@ class HealthChecker:
         except Exception as e:
             return {"status": "unhealthy", "details": f"Service error: {str(e)}"}
 
+    async def check_bots_health(self) -> dict:
+        """检查机器人健康状态"""
+        try:
+            if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+                return {"status": "healthy", "details": "Single bot mode"}
+
+            bot_manager = await get_bot_manager_dep()
+            if not bot_manager:
+                return {"status": "unhealthy", "details": "Bot manager not available"}
+
+            stats = bot_manager.get_stats()
+            if stats['healthy_bots'] > 0:
+                return {
+                    "status": "healthy",
+                    "details": f"{stats['healthy_bots']}/{stats['total_bots']} bots healthy"
+                }
+            else:
+                return {
+                    "status": "unhealthy",
+                    "details": f"No healthy bots (0/{stats['total_bots']})"
+                }
+        except Exception as e:
+            return {"status": "unhealthy", "details": f"Bot health check error: {str(e)}"}
+
     async def get_overall_health(self) -> dict:
         """获取整体健康状态"""
         checks = {
             "database": await self.check_database_health(),
             "cache": await self.check_cache_health(),
-            "services": await self.check_services_health()
+            "services": await self.check_services_health(),
+            "bots": await self.check_bots_health()
         }
 
         # 判断整体状态
@@ -450,32 +522,6 @@ class HealthChecker:
 async def get_health_checker() -> HealthChecker:
     """FastAPI依赖：获取健康检查器"""
     return HealthChecker()
-
-
-# === 消息队列依赖 ===
-_message_queue_service = None
-
-
-# async def get_message_queue_service():
-#     """获取消息队列服务"""
-#     global _message_queue_service
-#     if _message_queue_service is None and getattr(settings, 'ENABLE_MESSAGE_QUEUE', False):
-#         try:
-#             from app.message_handlers import MessageQueueService
-#             from app.services.conversation_service import ConversationService
-
-#             # 简化初始化
-#             conv_service = ConversationService(
-#                 support_group_id=settings.SUPPORT_GROUP_ID,
-#                 external_group_ids=settings.EXTERNAL_GROUP_IDS,
-#                 tg_func=tg
-#             )
-#             _message_queue_service = MessageQueueService(conv_service)
-#             logger.info("Message queue service initialized")
-#         except Exception as e:
-#             logger.error(f"Failed to initialize message queue service: {e}")
-
-#     return _message_queue_service
 
 
 # === 高级速率限制依赖 ===
@@ -500,3 +546,356 @@ async def check_advanced_rate_limit(user_id: int, action_type: str = "message") 
     except Exception as e:
         logger.error(f"Advanced rate limit check failed: {e}")
         return True  # 失败时允许通过
+
+
+# === 消息协调器依赖 ===
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.message_coordinator import MessageCoordinator
+    from app.message_processor import CoordinatedMessageHandler
+
+# 全局消息协调器和处理器引用
+_message_coordinator_instance: Optional['MessageCoordinator'] = None
+_coordinated_handler_instance: Optional['CoordinatedMessageHandler'] = None
+
+
+async def get_message_coordinator_dep():
+    """FastAPI依赖：获取消息协调器"""
+    global _message_coordinator_instance
+
+    # 检查是否启用了多机器人模式和Redis
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return None
+
+    if not getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True):
+        return None
+
+    if _message_coordinator_instance is None:
+        try:
+            from app.message_coordinator import get_message_coordinator
+            _message_coordinator_instance = await get_message_coordinator()
+            logger.info("消息协调器依赖初始化成功")
+        except Exception as e:
+            logger.error(f"获取消息协调器失败: {e}", exc_info=True)
+            return None
+
+    return _message_coordinator_instance
+
+
+async def get_coordinated_handler_dep(
+        conv_service=Depends(get_conversation_service)
+):
+    """FastAPI依赖：获取协调式消息处理器"""
+    global _coordinated_handler_instance
+
+    # 检查是否启用了消息协调
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+        return None
+
+    if not getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True):
+        return None
+
+    if _coordinated_handler_instance is None:
+        try:
+            from app.message_processor import create_coordinated_handler
+            _coordinated_handler_instance = await create_coordinated_handler(conv_service)
+            logger.info("协调式消息处理器依赖初始化成功")
+        except Exception as e:
+            logger.error(f"获取协调式消息处理器失败: {e}", exc_info=True)
+            return None
+
+    return _coordinated_handler_instance
+
+
+async def cleanup_message_coordination_deps():
+    """清理消息协调相关依赖"""
+    global _message_coordinator_instance, _coordinated_handler_instance
+
+    if _message_coordinator_instance:
+        try:
+            from app.message_coordinator import cleanup_message_coordinator
+            await cleanup_message_coordinator()
+            _message_coordinator_instance = None
+        except Exception as e:
+            logger.error(f"清理消息协调器失败: {e}", exc_info=True)
+
+    _coordinated_handler_instance = None
+
+
+# 更新 ApplicationLifecycleManager 类
+
+class ApplicationLifecycleManager:
+    """应用生命周期管理器（更新版本）"""
+
+    def __init__(self):
+        self.logger = get_logger("app.lifecycle")
+        self._initialized = False
+
+    async def startup(self):
+        """应用启动时的初始化"""
+        if self._initialized:
+            return
+
+        try:
+            self.logger.info("Starting application initialization...")
+
+            # 1. 初始化数据库
+            db_manager = get_database_manager()
+            await db_manager.initialize()
+
+            # 2. 初始化缓存
+            cache_manager = get_cache_manager()
+            if hasattr(cache_manager, 'start_cleanup_task'):
+                await cache_manager.start_cleanup_task()
+
+            # 3. 初始化监控
+            metrics = get_metrics_collector()
+            if hasattr(metrics, 'start_background_tasks'):
+                metrics.start_background_tasks()
+
+            # 4. 初始化机器人管理器（如果启用）
+            if getattr(settings, 'MULTI_BOT_ENABLED', False):
+                try:
+                    bot_manager = await get_bot_manager_dep()
+                    if bot_manager:
+                        self.logger.info("✅ 多机器人管理器初始化成功")
+
+                        # 记录机器人状态
+                        stats = bot_manager.get_stats()
+                        self.logger.info(f"机器人统计: {stats['healthy_bots']}/{stats['total_bots']} 健康")
+
+                        # 5. 初始化消息协调器（如果启用）
+                        if getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True):
+                            try:
+                                coordinator = await get_message_coordinator_dep()
+                                if coordinator:
+                                    self.logger.info("✅ 消息协调器初始化成功")
+
+                                    # 获取协调器统计
+                                    coord_stats = await coordinator.get_stats()
+                                    self.logger.info(f"协调器实例: {coord_stats['coordinator']['instance_id']}")
+                                else:
+                                    self.logger.warning("⚠️ 消息协调器初始化失败")
+                            except Exception as e:
+                                self.logger.error(f"❌ 消息协调器初始化异常: {e}", exc_info=True)
+                        else:
+                            self.logger.info("ℹ️ 消息协调功能已禁用")
+
+                    else:
+                        self.logger.warning("⚠️ 多机器人管理器初始化失败")
+                except Exception as e:
+                    self.logger.error(f"❌ 多机器人管理器初始化异常: {e}", exc_info=True)
+            else:
+                self.logger.info("ℹ️ 单机器人模式，跳过多机器人功能初始化")
+
+            # 6. 初始化服务
+            service_manager = get_service_manager()
+            # 服务将在首次使用时初始化
+
+            # 7. 检查其他功能配置
+            self.logger.info(f"消息队列启用状态: {getattr(settings, 'ENABLE_MESSAGE_QUEUE', False)}")
+            self.logger.info(f"消息协调启用状态: {getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True)}")
+            self.logger.info(f"Redis URL: {getattr(settings, 'REDIS_URL', 'Not set')}")
+            self.logger.info(f"高级速率限制启用状态: {getattr(settings, 'ADVANCED_RATE_LIMIT_ENABLED', True)}")
+            self.logger.info(f"高级用户数量: {len(getattr(settings, 'PREMIUM_USER_IDS', []))}")
+
+            # 8. 测试速率限制器初始化
+            try:
+                from app.rate_limit import get_rate_limiter
+                rate_limiter = await get_rate_limiter()
+                self.logger.info("✅ 高级速率限制器初始化成功")
+            except Exception as e:
+                self.logger.warning(f"⚠️ 高级速率限制器初始化失败: {e}")
+
+            # 9. 测试消息队列初始化（如果启用）
+            if getattr(settings, 'ENABLE_MESSAGE_QUEUE', False):
+                try:
+                    # 这里可以添加消息队列服务的初始化
+                    self.logger.info("✅ 消息队列服务配置检查完成")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 消息队列服务初始化失败: {e}")
+
+            self._initialized = True
+            self.logger.info("Application initialization completed")
+
+        except Exception as e:
+            self.logger.error("Application initialization failed", exc_info=True)
+            raise
+
+    async def shutdown(self):
+        """应用关闭时的清理"""
+        if not self._initialized:
+            return
+
+        try:
+            self.logger.info("Starting application shutdown...")
+
+            # 1. 清理消息协调相关组件
+            await cleanup_message_coordination_deps()
+
+            # 2. 清理机器人管理器
+            await cleanup_bot_manager_dep()
+
+            # 3. 清理服务
+            service_manager = get_service_manager()
+            await service_manager.cleanup()
+
+            # 4. 停止监控
+            metrics = get_metrics_collector()
+            if hasattr(metrics, 'stop_background_tasks'):
+                await metrics.stop_background_tasks()
+
+            # 5. 清理缓存
+            cache_manager = get_cache_manager()
+            if hasattr(cache_manager, 'stop_cleanup_task'):
+                await cache_manager.stop_cleanup_task()
+
+            # 6. 关闭数据库
+            db_manager = get_database_manager()
+            await db_manager.close()
+
+            self._initialized = False
+            self.logger.info("Application shutdown completed")
+
+        except Exception as e:
+            self.logger.error("Error during application shutdown", exc_info=True)
+
+
+# 更新健康检查器
+
+class HealthChecker:
+    """健康检查器（更新版本）"""
+
+    def __init__(self):
+        self.logger = get_logger("app.health")
+
+    async def check_database_health(self) -> dict:
+        """检查数据库健康状态"""
+        try:
+            def _test_database():
+                try:
+                    # 首先尝试简单的查询
+                    cursor = db.execute_sql("SELECT 1")
+                    basic_result = cursor.fetchone()
+
+                    if not basic_result:
+                        return False, "Basic query failed"
+
+                    # 然后尝试查询我们的实际表
+                    count = Conversation.select().count()
+                    return True, f"Database responding, {count} conversations in table"
+
+                except Exception as e:
+                    return False, f"Query error: {str(e)}"
+
+            # 在线程池中执行数据库查询
+            success, details = await run_in_threadpool(_test_database)
+
+            if success:
+                return {"status": "healthy", "details": details}
+            else:
+                return {"status": "unhealthy", "details": details}
+
+        except Exception as e:
+            self.logger.error(f"数据库健康检查异常: {e}", exc_info=True)
+            return {"status": "unhealthy", "details": f"Database health check error: {str(e)}"}
+
+    async def check_cache_health(self) -> dict:
+        """检查缓存健康状态"""
+        try:
+            cache = get_cache_manager()
+            stats = await cache.get_stats()
+            return {
+                "status": "healthy",
+                "details": f"Cache active with {stats['cache_size']} entries"
+            }
+        except Exception as e:
+            return {"status": "unhealthy", "details": f"Cache error: {str(e)}"}
+
+    async def check_services_health(self) -> dict:
+        """检查服务健康状态"""
+        try:
+            service_manager = get_service_manager()
+            if service_manager._conversation_service:
+                return {"status": "healthy", "details": "ConversationService active"}
+            else:
+                return {"status": "healthy", "details": "ConversationService not yet initialized"}
+        except Exception as e:
+            return {"status": "unhealthy", "details": f"Service error: {str(e)}"}
+
+    async def check_bots_health(self) -> dict:
+        """检查机器人健康状态"""
+        try:
+            if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+                return {"status": "healthy", "details": "Single bot mode"}
+
+            bot_manager = await get_bot_manager_dep()
+            if not bot_manager:
+                return {"status": "unhealthy", "details": "Bot manager not available"}
+
+            stats = bot_manager.get_stats()
+            if stats['healthy_bots'] > 0:
+                return {
+                    "status": "healthy",
+                    "details": f"{stats['healthy_bots']}/{stats['total_bots']} bots healthy"
+                }
+            else:
+                return {
+                    "status": "unhealthy",
+                    "details": f"No healthy bots (0/{stats['total_bots']})"
+                }
+        except Exception as e:
+            return {"status": "unhealthy", "details": f"Bot health check error: {str(e)}"}
+
+    async def check_coordination_health(self) -> dict:
+        """检查消息协调器健康状态"""
+        try:
+            if not getattr(settings, 'MULTI_BOT_ENABLED', False):
+                return {"status": "healthy", "details": "Single bot mode, coordination not needed"}
+
+            if not getattr(settings, 'ENABLE_MESSAGE_COORDINATION', True):
+                return {"status": "healthy", "details": "Message coordination disabled"}
+
+            coordinator = await get_message_coordinator_dep()
+            if not coordinator:
+                return {"status": "unhealthy", "details": "Message coordinator not available"}
+
+            stats = await coordinator.get_stats()
+            coordinator_running = stats.get('coordinator', {}).get('running', False)
+
+            if coordinator_running:
+                queue_stats = stats.get('queue', {})
+                pending_count = queue_stats.get('pending_count', 0)
+                processing_count = queue_stats.get('processing_count', 0)
+
+                return {
+                    "status": "healthy",
+                    "details": f"Coordinator running, {pending_count} pending, {processing_count} processing"
+                }
+            else:
+                return {"status": "unhealthy", "details": "Message coordinator not running"}
+
+        except Exception as e:
+            return {"status": "unhealthy", "details": f"Coordination health check error: {str(e)}"}
+
+    async def get_overall_health(self) -> dict:
+        """获取整体健康状态"""
+        checks = {
+            "database": await self.check_database_health(),
+            "cache": await self.check_cache_health(),
+            "services": await self.check_services_health(),
+            "bots": await self.check_bots_health(),
+            "coordination": await self.check_coordination_health()
+        }
+
+        # 判断整体状态
+        all_healthy = all(check["status"] == "healthy" for check in checks.values())
+        overall_status = "healthy" if all_healthy else "unhealthy"
+
+        return {
+            "status": overall_status,
+            "timestamp": asyncio.get_event_loop().time(),
+            "checks": checks
+        }
