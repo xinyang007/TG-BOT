@@ -1,18 +1,26 @@
+# app/tg_utils.py
+
+import time
+
 import httpx
 import json
 import logging
-import asyncio  # 导入 asyncio 用于 sleep
+import asyncio
 from typing import Optional, Dict, Any
-from .settings import settings  # 使用加载的设置
+from .settings import settings
 from .logging_config import get_logger
+from .failover_manager import get_failover_manager, FailoverReason
+from .circuit_breaker import get_circuit_breaker, CircuitBreakerConfig, CircuitBreakerError
+from .failover_events import get_failover_event_store, FailoverEventRecord, EventSeverity
+import uuid
 
 logger = get_logger("app.tg_utils")
 
-# 使用一个 httpx 客户端实例，可以在应用生命周期内重用
-client = httpx.AsyncClient(timeout=30)  # 增加超时时间，特别是对于可能需要等待的 API
+client = httpx.AsyncClient(timeout=30)
 
-# 全局机器人管理器引用
 _bot_manager = None
+_failover_manager = None
+_circuit_breaker_registry = None
 
 
 class TelegramAPIError(Exception):
@@ -25,7 +33,6 @@ class TelegramAPIError(Exception):
         self.http_status = http_status
         self.response_text = response_text
 
-        # 构造错误消息
         message = f"Telegram API Error: {description}"
         if error_code:
             message += f" (Code: {error_code})"
@@ -53,6 +60,7 @@ class TelegramAPIError(Exception):
         description_lower = self.description.lower()
         return any(keyword in description_lower for keyword in topic_keywords)
 
+
 async def get_bot_manager():
     """获取机器人管理器实例"""
     global _bot_manager
@@ -72,105 +80,160 @@ def get_base_url(token: str) -> str:
 
 async def tg_with_bot_selection(method: str, data: dict, max_retries: int = 5, initial_delay: int = 1):
     """
-    使用机器人选择策略发送请求到 Telegram Bot API
-
-    Args:
-        method: API 方法名
-        data: API 方法的参数字典
-        max_retries: 最大重试次数
-        initial_delay: 初始重试等待秒数
-
-    Returns:
-        Telegram API 响应中的 'result' 部分的 JSON 数据
+    使用机器人选择策略发送请求到 Telegram Bot API（增强故障转移版本）
     """
     bot_manager = await get_bot_manager()
+    failover_manager = await get_failover_manager_instance()
 
     # 如果没有启用多机器人模式或无法获取管理器，使用原始逻辑
     if not bot_manager:
         return await tg_single_bot(method, data, max_retries, initial_delay)
 
     # 尝试使用健康的机器人
-    healthy_bots = bot_manager.get_healthy_bots()
-    if not healthy_bots:
-        logger.error("没有可用的健康机器人，尝试使用主机器人")
+    # get_available_bots 返回的是按负载排序的可用机器人
+    available_bots = bot_manager.get_available_bots()
+    if not available_bots:
+        logger.error("没有可用的机器人")
+        # 记录严重故障事件
+        if failover_manager:
+            await _record_system_failure_event("no_available_bots", "所有机器人不可用")
+        # 此时只能尝试 tg_single_bot，但它也可能失败
         return await tg_single_bot(method, data, max_retries, initial_delay)
 
-    # 按优先级和负载选择最佳机器人
-    best_bot = bot_manager.get_best_bot()
-    if not best_bot:
-        logger.error("无法选择最佳机器人，回退到主机器人")
-        return await tg_single_bot(method, data, max_retries, initial_delay)
+    # 遍历可用机器人，尝试找到一个没有被熔断的
+    for bot in available_bots:
+        circuit_breaker = await get_circuit_breaker(f"bot_{bot.bot_id}",
+                                                    CircuitBreakerConfig(**settings.get_circuit_breaker_config()))
 
-    logger.debug(f"选择机器人 {best_bot.bot_id} ({best_bot.config.name}) 执行 {method}")
+        try:
+            # 通过熔断器检查机器人状态，如果熔断器打开，会抛出 CircuitBreakerError
+            await circuit_breaker.call(lambda: _check_bot_readiness(bot))
 
+            logger.debug(f"选择机器人 {bot.bot_id} ({bot.config.name}) 执行 {method}")
+
+            # 使用选中的机器人发送请求
+            result = await _execute_bot_request(bot, method, data, max_retries, initial_delay)
+
+            # 记录成功请求
+            await bot_manager.record_bot_request(bot.bot_id)
+            return result
+
+        except CircuitBreakerError as e:
+            logger.warning(f"机器人 {bot.bot_id} 熔断器开启，跳过该机器人: {e}")
+            # CircuitBreakerError 不会触发故障转移，因为熔断器已经处理了状态
+            continue  # 尝试下一个机器人
+
+        except Exception as e:
+            # 其他错误，可能是连接问题、API错误等
+            logger.warning(f"机器人 {bot.bot_id} 执行请求失败: {e}. 尝试下一个机器人。", exc_info=True)
+            # 在这里触发故障转移，并继续尝试下一个机器人
+            await _handle_bot_api_exception(bot, e, failover_manager)
+            continue
+
+    # 如果所有机器人尝试都失败了 (都被熔断或都失败了)
+    logger.error(f"所有可用机器人尝试 {method} 失败")
+    # 此时，作为最后的手段，尝试使用 tg_single_bot （如果它仍然存在）
+    # 但这通常意味着系统已处于非常不健康的状态
+    return await tg_single_bot(method, data, max_retries, initial_delay)
+
+
+async def _execute_with_failover(bot, method: str, data: dict, max_retries: int, initial_delay: int):
+    """带故障转移的请求执行 (此函数逻辑已并入tg_with_bot_selection，不再需要单独调用)"""
+    # 此函数实际上已经不再被直接调用，其逻辑已整合到 tg_with_bot_selection 中
+    # 保留它只是为了避免删除可能存在的外部引用，但在当前设计中它是冗余的
+    logger.warning("_execute_with_failover 函数被调用，但这可能是不必要的。请检查调用栈。")
+    return await _execute_bot_request(bot, method, data, max_retries, initial_delay)
+
+
+async def _execute_bot_request(bot_instance, method: str, data: dict, max_retries: int, initial_delay: int):
+    """执行机器人请求的核心逻辑，会抛出TelegramAPIError"""
+    # 这里的 `bot_instance` 是一个 BotInstance 对象，包含 token 和 bot_id
+    # CircuitBreaker 和 FailoverManager 已经由调用者处理，这里只管执行请求和抛出异常
+    return await tg_with_specific_bot(
+        bot_instance.config.token, method, data, max_retries, initial_delay,
+        bot_id_for_logging=bot_instance.bot_id  # 传入bot_id用于tg_with_specific_bot的日志
+    )
+
+
+def _check_bot_readiness(bot) -> bool:
+    """检查机器人就绪状态（同步函数，供熔断器使用）"""
+    # 简单的就绪检查
+    if not bot.is_available():
+        raise Exception(f"机器人 {bot.bot_id} 不可用")
+    return True
+
+
+async def _record_system_failure_event(reason: str, description: str):
+    """记录系统级故障事件"""
     try:
-        # 使用选中的机器人发送请求
-        result = await tg_with_specific_bot(
-            best_bot.config.token, method, data, max_retries, initial_delay
+        event_store = await get_failover_event_store()
+        event = FailoverEventRecord(
+            event_id=str(uuid.uuid4())[:8],
+            bot_id="system",
+            event_type="system_failure",
+            severity=EventSeverity.CRITICAL,
+            timestamp=time.time(),
+            description=description,
+            metadata={"reason": reason}
         )
-
-        # 记录成功请求
-        await bot_manager.record_bot_request(best_bot.bot_id)
-        return result
-
+        await event_store.store_event(event)
     except Exception as e:
-        logger.warning(f"机器人 {best_bot.bot_id} 请求失败: {e}")
+        logger.error(f"记录系统故障事件失败: {e}")
 
-        # 检查是否是429错误
-        if "429" in str(e) or "Too Many Requests" in str(e):
-            await bot_manager.mark_bot_rate_limited(best_bot.bot_id, 60)
 
-            # 尝试使用其他健康机器人
-            other_bots = [bot for bot in healthy_bots if bot.bot_id != best_bot.bot_id]
-            for fallback_bot in other_bots:
-                try:
-                    logger.info(f"尝试使用备用机器人 {fallback_bot.bot_id}")
-                    result = await tg_with_specific_bot(
-                        fallback_bot.config.token, method, data, max_retries, initial_delay
-                    )
-                    await bot_manager.record_bot_request(fallback_bot.bot_id)
-                    return result
-                except Exception as fallback_e:
-                    logger.warning(f"备用机器人 {fallback_bot.bot_id} 也失败: {fallback_e}")
-                    continue
+# Helper to handle exceptions from _execute_bot_request and notify failover manager
+async def _handle_bot_api_exception(bot_instance, exception: Exception, failover_manager):
+    """处理机器人API调用异常并通知故障转移管理器"""
+    from .failover_manager import FailoverReason  # Ensure import
+    error_str = str(exception).lower()
+    reason = FailoverReason.API_ERROR  # Default reason
 
-        # 如果所有机器人都失败，抛出最后的异常
-        raise
+    if "429" in error_str or "too many requests" in error_str:
+        reason = FailoverReason.RATE_LIMITED
+        logger.warning(f"机器人 {bot_instance.bot_id} 遇到429限速错误")
+    elif "connection" in error_str or "timeout" in error_str or isinstance(exception, httpx.RequestError):
+        reason = FailoverReason.CONNECTION_ERROR
+
+    if failover_manager:
+        await failover_manager.handle_bot_failure(
+            bot_instance.bot_id, reason, str(exception)
+        )
+    else:
+        logger.warning(f"未能通知故障转移管理器关于机器人 {bot_instance.bot_id} 的故障 ({reason.value})：{exception}")
 
 
 async def tg_with_specific_bot(token: str, method: str, data: dict,
-                               max_retries: int = 5, initial_delay: int = 1):
+                               max_retries: int = 5, initial_delay: int = 1,
+                               bot_id_for_logging: Optional[str] = None):
     """
     使用指定token的机器人发送请求到 Telegram Bot API
     """
     url = f"{get_base_url(token)}/{method}"
     retries = 0
     delay = initial_delay
+    log_prefix = f"Bot({bot_id_for_logging or 'N/A'}) API Call({method}):"
 
     while retries <= max_retries:
         try:
             r = await client.post(url, json=data)
 
-            # 先获取响应内容（无论状态码如何）
             try:
                 result = r.json()
-            except:
-                # 如果不能解析 JSON，创建基本错误信息
+            except json.JSONDecodeError:
+                # If not JSON, but status is bad, raise specific error
                 if r.status_code >= 400:
                     raise TelegramAPIError(
-                        description=f"HTTP {r.status_code}: {r.text[:200]}",
+                        description=f"HTTP {r.status_code}: Non-JSON response for {method}. Text: {r.text[:200]}",
                         http_status=r.status_code,
                         response_text=r.text
                     )
-                raise
+                # If not JSON but status is good, something else is wrong
+                raise Exception(f"{log_prefix} Unexpected non-JSON response with status {r.status_code}") from None
 
-            # 检查 HTTP 状态码
             if r.status_code >= 400:
-                # 从 Telegram API 响应中提取详细错误信息
                 error_code = result.get("error_code", r.status_code)
                 description = result.get("description", f"HTTP {r.status_code}")
 
-                # 创建包含详细信息的异常
                 detailed_error = TelegramAPIError(
                     description=description,
                     error_code=error_code,
@@ -178,33 +241,33 @@ async def tg_with_specific_bot(token: str, method: str, data: dict,
                     response_text=r.text
                 )
 
-                # 如果是 429 错误，进行重试逻辑
                 if error_code == 429 and retries < max_retries:
                     retry_after = result.get("parameters", {}).get("retry_after", delay)
-                    logger.warning(f"机器人被限速，{retry_after} 秒后重试。尝试 {retries + 1}/{max_retries + 1}")
+                    logger.warning(
+                        f"{log_prefix} 429 Rate limited, retry after {retry_after}s. Attempt {retries + 1}/{max_retries + 1}")
                     await asyncio.sleep(retry_after)
                     retries += 1
                     delay *= 2
                     continue
                 else:
-                    logger.error(f"Telegram API 失败: method={method}, code={error_code}, description='{description}'")
+                    logger.error(f"{log_prefix} Telegram API failed: code={error_code}, description='{description}'")
                     raise detailed_error
 
-            # 检查 Telegram specific 'ok' field
             if not result.get("ok"):
                 error_code = result.get("error_code", "N/A")
                 description = result.get("description", "No description")
 
                 if error_code == 429 and retries < max_retries:
                     retry_after = result.get("parameters", {}).get("retry_after", delay)
-                    logger.warning(f"Telegram API 返回 429，{retry_after} 秒后重试。尝试 {retries + 1}/{max_retries + 1}")
+                    logger.warning(
+                        f"{log_prefix} API returned 429, retry after {retry_after}s. Attempt {retries + 1}/{max_retries + 1}")
                     await asyncio.sleep(retry_after)
                     retries += 1
                     delay *= 2
                     continue
                 else:
                     logger.error(
-                        f"Telegram API 报告失败: method={method}, code={error_code}, description='{description}'")
+                        f"{log_prefix} Telegram API reported failure: code={error_code}, description='{description}'")
                     raise TelegramAPIError(
                         description=description,
                         error_code=error_code,
@@ -212,50 +275,16 @@ async def tg_with_specific_bot(token: str, method: str, data: dict,
                         response_text=r.text
                     )
 
-            return result.get("result")  # 成功返回结果
+            return result.get("result")
 
         except TelegramAPIError:
-            # 重新抛出我们的自定义异常
             raise
 
-        except httpx.HTTPStatusError as e:
-            # 处理其他 HTTP 错误（理论上不应该到这里，因为上面已经处理了）
-            error_code = e.response.status_code
-            if error_code == 429 and retries < max_retries:
-                retry_after_header = e.response.headers.get("Retry-After")
-                try:
-                    retry_after = int(retry_after_header) if retry_after_header else delay
-                except ValueError:
-                    retry_after = delay
-
-                logger.warning(f"HTTP 429 限速，{retry_after} 秒后重试。尝试 {retries + 1}/{max_retries + 1}")
-                await asyncio.sleep(retry_after)
-                retries += 1
-                delay *= 2
-                continue
-            else:
-                logger.error(f"HTTP 错误 {method}: {e.response.status_code} - {e.response.text}")
-                # 尝试从响应中提取 Telegram 错误
-                try:
-                    response_data = e.response.json()
-                    description = response_data.get("description", str(e))
-                    raise TelegramAPIError(
-                        description=description,
-                        error_code=response_data.get("error_code", error_code),
-                        http_status=error_code,
-                        response_text=e.response.text
-                    )
-                except:
-                    raise TelegramAPIError(
-                        description=str(e),
-                        http_status=error_code,
-                        response_text=e.response.text if hasattr(e, 'response') else str(e)
-                    )
-
         except httpx.RequestError as e:
-            logger.error(f"请求错误 {method}: {e}")
+            logger.error(f"{log_prefix} Request error: {e}", exc_info=True)
             if retries < max_retries:
-                logger.warning(f"请求错误重试，{delay} 秒后重试。尝试 {retries + 1}/{max_retries + 1}")
+                logger.warning(
+                    f"{log_prefix} Request error, retrying in {delay}s. Attempt {retries + 1}/{max_retries + 1}")
                 await asyncio.sleep(delay)
                 retries += 1
                 delay *= 2
@@ -264,47 +293,86 @@ async def tg_with_specific_bot(token: str, method: str, data: dict,
                 raise
 
         except Exception as e:
-            logger.error(f"调用 {method} 时发生意外错误: {e}")
+            logger.error(f"{log_prefix} Unexpected error: {e}", exc_info=True)
             raise
 
-    logger.error(f"方法 {method} 在 {max_retries + 1} 次尝试后仍然失败")
-    raise Exception(f"方法 {method} 在多次重试后仍然失败")
+    logger.error(f"{log_prefix} Failed after {max_retries + 1} attempts.")
+    raise Exception(f"{log_prefix} Failed after multiple retries.")
 
 
 async def tg_single_bot(method: str, data: dict, max_retries: int = 5, initial_delay: int = 1):
     """
     使用单机器人模式（原始逻辑），支持向后兼容
     """
-    # 获取主要token
     token = getattr(settings, 'BOT_TOKEN', '') or getattr(settings, 'PRIMARY_BOT_TOKEN', '')
     if not token:
         raise ValueError("未设置机器人Token")
 
-    return await tg_with_specific_bot(token, method, data, max_retries, initial_delay)
+    return await tg_with_specific_bot(token, method, data, max_retries, initial_delay, bot_id_for_logging="SINGLE_BOT")
 
 
-async def tg(method: str, data: dict, max_retries: int = 5, initial_delay: int = 1):
+async def tg(method: str, data: dict, specific_bot_token: Optional[str] = None, max_retries: int = 5,
+             initial_delay: int = 1):
     """
-    主要的API调用函数，自动选择单机器人或多机器人模式
+    主要的API调用函数，自动选择单机器人或多机器人模式，并支持指定优先机器人。
 
     Args:
         method: API 方法名
         data: API 方法的参数字典
+        specific_bot_token: 可选。如果提供，将优先尝试使用此token对应的机器人。
+                            如果该机器人失败，会回退到自动选择其他机器人。
         max_retries: 最大重试次数
         initial_delay: 初始重试等待秒数
 
     Returns:
         Telegram API 响应中的 'result' 部分的 JSON 数据
     """
-    if getattr(settings, 'MULTI_BOT_ENABLED', False):
-        return await tg_with_bot_selection(method, data, max_retries, initial_delay)
-    else:
+    bot_manager = await get_bot_manager()
+    failover_manager = await get_failover_manager_instance()
+
+    # 如果没有启用多机器人模式，或者没有机器人管理器，回退到单机器人模式
+    if not getattr(settings, 'MULTI_BOT_ENABLED', False) or not bot_manager:
         return await tg_single_bot(method, data, max_retries, initial_delay)
 
+    # 优先尝试使用 specific_bot_token
+    if specific_bot_token:
+        # 查找对应的 BotInstance
+        preferred_bot = None
+        for bot_id, bot_instance in bot_manager.bots.items():
+            if bot_instance.config.token == specific_bot_token:
+                preferred_bot = bot_instance
+                break
 
-async def copy_any(src_chat_id, dst_chat_id, message_id: int, extra_params: dict | None = None):
+        if preferred_bot and preferred_bot.is_available():
+            circuit_breaker = await get_circuit_breaker(f"bot_{preferred_bot.bot_id}",
+                                                        CircuitBreakerConfig(**settings.get_circuit_breaker_config()))
+            try:
+                # 通过熔断器尝试使用此特定机器人
+                await circuit_breaker.call(lambda: _check_bot_readiness(preferred_bot))
+                logger.debug(f"优先使用指定机器人 {preferred_bot.bot_id} ({preferred_bot.config.name}) 执行 {method}")
+                result = await _execute_bot_request(preferred_bot, method, data, max_retries, initial_delay)
+                await bot_manager.record_bot_request(preferred_bot.bot_id)
+                return result
+            except CircuitBreakerError as e:
+                logger.warning(f"指定机器人 {preferred_bot.bot_id} 熔断器开启，回退到自动选择: {e}")
+                # Fall through to auto-selection below
+            except Exception as e:
+                logger.warning(f"指定机器人 {preferred_bot.bot_id} 执行请求失败，回退到自动选择: {e}", exc_info=True)
+                await _handle_bot_api_exception(preferred_bot, e, failover_manager)
+                # Fall through to auto-selection below
+        else:
+            if specific_bot_token:  # Log only if a specific token was actually passed
+                logger.warning(
+                    f"指定机器人 (token ending with {specific_bot_token[-5:]}) 不可用或未找到，回退到自动选择。")
+
+    # 如果没有指定机器人，或者指定机器人不可用/失败，则进行自动选择
+    return await tg_with_bot_selection(method, data, max_retries, initial_delay)
+
+
+async def copy_any(src_chat_id, dst_chat_id, message_id: int, extra_params: dict | None = None,
+                   specific_bot_token: Optional[str] = None):
     """
-    复制消息的辅助函数
+    复制消息的辅助函数，支持指定机器人token
     """
     payload = {
         "chat_id": dst_chat_id,
@@ -316,18 +384,17 @@ async def copy_any(src_chat_id, dst_chat_id, message_id: int, extra_params: dict
         payload.update(extra_params)
 
     logger.debug(f"复制消息 {message_id} 从 {src_chat_id} 到 {dst_chat_id}")
-    return await tg("copyMessage", payload)
+    return await tg("copyMessage", payload, specific_bot_token=specific_bot_token)
 
 
+# 在 send_with_prefix 函数中增强话题恢复的故障转移逻辑
 async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, sender_name, msg,
-                           conversation_service=None, entity_id=None, entity_type=None, entity_name=None):
-    """发送带前缀的消息，根据消息类型选择不同的发送方法，包含话题恢复功能"""
+                           conversation_service=None, entity_id=None, entity_type=None, entity_name=None,
+                           specific_bot_token: Optional[str] = None):  # 新增 specific_bot_token
+    """发送带前缀的消息（增强故障转移版本）"""
     prefix = f"👤 {sender_name or '未知发送者'}:\n"
-
-    # 创建消息副本进行修改
     msg_to_send = msg.copy()
 
-    # 在消息文本或 caption 前添加前缀
     original_body = msg_to_send.get("text") or msg_to_send.get("caption")
 
     if original_body is not None:
@@ -336,21 +403,27 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
         elif "caption" in msg_to_send and msg_to_send.get("caption") is not None:
             msg_to_send["caption"] = prefix + msg_to_send.get("caption", "")
 
-    # 话题恢复处理函数
-    async def handle_topic_recovery(error_str: str):
-        """处理话题恢复"""
+    # 增强的话题恢复处理函数（带故障转移）
+    async def handle_topic_recovery_with_failover(error_str: str, auto_tg=None):
+        """处理话题恢复（增强故障转移版本）"""
         if not conversation_service or not entity_id or not entity_type:
             logger.warning("话题恢复需要 conversation_service, entity_id 和 entity_type 参数")
             return None
 
         # 检测话题相关错误
-        topic_errors = ['topic_deleted', 'thread not found', 'message thread not found']
-        if any(keyword in error_str.lower() for keyword in topic_errors):
+        topic_keywords = ['topic_deleted', 'thread not found', 'message thread not found', 'topic not found',
+                          'forum topic not found']
+        if any(keyword in error_str.lower() for keyword in topic_keywords):
             logger.warning(f"检测到话题错误: {error_str}，开始话题恢复")
 
             try:
                 from .topic_recovery import get_topic_recovery_service
-                recovery_service = get_topic_recovery_service(conversation_service, tg)
+                recovery_service = get_topic_recovery_service(conversation_service, auto_tg)  # 话题恢复使用auto_tg
+
+                # 使用故障转移管理器记录话题故障
+                failover_manager = await get_failover_manager_instance()
+                if failover_manager:
+                    await _record_topic_failure_event(entity_id, entity_type, error_str)
 
                 recovery_result = await recovery_service.handle_topic_deleted_error(
                     entity_id, entity_type, entity_name
@@ -358,6 +431,11 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
 
                 if recovery_result.success:
                     logger.info(f"✅ 话题恢复成功，新话题ID: {recovery_result.new_topic_id}")
+
+                    # 记录恢复成功事件
+                    if failover_manager:
+                        await _record_topic_recovery_event(entity_id, entity_type, recovery_result.new_topic_id)
+
                     return recovery_result.new_topic_id
                 else:
                     logger.error(f"❌ 话题恢复失败: {recovery_result.error_message}")
@@ -368,10 +446,11 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
         return None
 
     # 增强的错误处理和重试逻辑
-    async def send_message_with_recovery(payload):
-        """发送消息，包含话题恢复功能"""
+    async def send_message_with_recovery_and_failover(payload, current_message_thread_id):
+        """发送消息，包含话题恢复和故障转移功能"""
         try:
-            return await tg(payload["method"], payload["data"])
+            # 尝试发送消息
+            return await tg(payload["method"], payload["data"], specific_bot_token=specific_bot_token)
 
         except Exception as e:
             # 获取详细的错误信息
@@ -384,36 +463,36 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
                 logger.warning(f"Telegram API 错误: {error_description}")
             else:
                 error_description = str(e).lower()
-                # 传统的关键词检测作为后备
-                topic_keywords = ['topic_deleted', 'thread not found', 'message thread not found']
+                topic_keywords = ['topic_deleted', 'thread not found', 'message thread not found', 'topic not found',
+                                  'forum topic not found']
                 is_topic_error = any(keyword in error_description for keyword in topic_keywords)
                 logger.warning(f"发送消息失败: {error_description}")
 
             # 尝试话题恢复
             if is_topic_error:
                 logger.warning(f"检测到话题相关错误: {error_description}，尝试话题恢复")
-                new_topic_id = await handle_topic_recovery(error_description)
+                new_topic_id = await handle_topic_recovery_with_failover(error_description)
 
-                if new_topic_id:
+                if new_topic_id and new_topic_id != current_message_thread_id:
                     # 使用新话题ID重试
                     logger.info(f"使用新话题ID {new_topic_id} 重试发送消息")
                     recovery_data = payload["data"].copy()
                     recovery_data["message_thread_id"] = new_topic_id
 
                     try:
-                        result = await tg(payload["method"], recovery_data)
+                        result = await tg(payload["method"], recovery_data, specific_bot_token=specific_bot_token)
                         logger.info("✅ 使用恢复的话题成功发送消息")
                         return result
                     except Exception as recovery_send_error:
                         logger.error(f"使用恢复话题发送仍然失败: {recovery_send_error}")
 
-                # 话题恢复失败，尝试移除话题ID
-                logger.warning("话题恢复失败，尝试移除话题ID重新发送")
+                # 话题恢复失败或新话题ID与原ID相同（可能意味着没有实际恢复），尝试移除话题ID
+                logger.warning("话题恢复失败或未改变话题ID，尝试移除话题ID重新发送")
                 fallback_data = payload["data"].copy()
                 fallback_data.pop("message_thread_id", None)
 
                 try:
-                    result = await tg(payload["method"], fallback_data)
+                    result = await tg(payload["method"], fallback_data, specific_bot_token=specific_bot_token)
                     logger.info(f"✅ 成功通过移除话题ID发送消息")
                     return result
                 except Exception as fallback_error:
@@ -423,14 +502,14 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
                 # 非话题相关错误直接抛出
                 raise e
 
-    # 根据消息类型选择不同的发送方法
+    # 使用增强的发送函数
     try:
         if "photo" in msg_to_send:
             photo = sorted(msg_to_send.get("photo"), key=lambda x: x.get("width", 0), reverse=True)[
                 0] if msg_to_send.get("photo") else None
             if photo:
                 logger.debug(f"发送图片消息到话题 {message_thread_id}")
-                return await send_message_with_recovery({
+                return await send_message_with_recovery_and_failover({
                     "method": "sendPhoto",
                     "data": {
                         "chat_id": dest_chat_id,
@@ -439,10 +518,10 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
                         "caption": msg_to_send.get("caption"),
                         "parse_mode": "HTML"
                     }
-                })
+                }, message_thread_id)  # 传入当前message_thread_id
         elif "video" in msg_to_send:
             logger.debug(f"发送视频消息到话题 {message_thread_id}")
-            return await send_message_with_recovery({
+            return await send_message_with_recovery_and_failover({
                 "method": "sendVideo",
                 "data": {
                     "chat_id": dest_chat_id,
@@ -451,10 +530,10 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
                     "caption": msg_to_send.get("caption"),
                     "parse_mode": "HTML"
                 }
-            })
+            }, message_thread_id)
         elif "document" in msg_to_send:
             logger.debug(f"发送文档消息到话题 {message_thread_id}")
-            return await send_message_with_recovery({
+            return await send_message_with_recovery_and_failover({
                 "method": "sendDocument",
                 "data": {
                     "chat_id": dest_chat_id,
@@ -463,10 +542,10 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
                     "caption": msg_to_send.get("caption"),
                     "parse_mode": "HTML"
                 }
-            })
+            }, message_thread_id)
         elif "text" in msg_to_send and msg_to_send.get("text") is not None:
             logger.debug(f"发送文本消息到话题 {message_thread_id}")
-            return await send_message_with_recovery({
+            return await send_message_with_recovery_and_failover({
                 "method": "sendMessage",
                 "data": {
                     "chat_id": dest_chat_id,
@@ -474,30 +553,37 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
                     "text": msg_to_send.get("text"),
                     "parse_mode": "HTML"
                 }
-            })
+            }, message_thread_id)
         else:
             # 回退到 copyMessage
             logger.debug(f"回退到复制消息模式")
             try:
+                # copy_any 也需要 specific_bot_token
                 return await copy_any(source_chat_id, dest_chat_id, msg_to_send.get("message_id"),
-                                      {"message_thread_id": message_thread_id})
+                                      {"message_thread_id": message_thread_id},
+                                      specific_bot_token=specific_bot_token)
             except Exception as copy_error:
                 error_str = str(copy_error).lower()
 
                 # 尝试话题恢复
-                new_topic_id = await handle_topic_recovery(error_str)
-                if new_topic_id:
+                new_topic_id = await handle_topic_recovery_with_failover(error_str)
+                if new_topic_id and new_topic_id != message_thread_id:
                     logger.info(f"使用恢复的话题ID {new_topic_id} 重试复制消息")
                     try:
                         return await copy_any(source_chat_id, dest_chat_id, msg_to_send.get("message_id"),
-                                              {"message_thread_id": new_topic_id})
+                                              {"message_thread_id": new_topic_id},
+                                              specific_bot_token=specific_bot_token)
                     except Exception as recovery_copy_error:
                         logger.error(f"使用恢复话题复制消息仍然失败: {recovery_copy_error}")
 
                 # 最后回退：不使用话题复制
-                if "thread not found" in error_str or "topic_deleted" in error_str:
+                if any(keyword in error_str for keyword in
+                       ['topic_deleted', 'thread not found', 'message thread not found', 'topic not found',
+                        'forum topic not found']):
                     logger.warning("话题无效，使用无话题的复制")
-                    return await copy_any(source_chat_id, dest_chat_id, msg_to_send.get("message_id"), {})
+                    # 无话题复制也需要 specific_bot_token
+                    return await copy_any(source_chat_id, dest_chat_id, msg_to_send.get("message_id"), {},
+                                          specific_bot_token=specific_bot_token)
                 else:
                     raise copy_error
 
@@ -513,7 +599,7 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
                 "chat_id": dest_chat_id,
                 "text": simple_text[:4096],  # 限制长度
                 "parse_mode": "HTML"
-            })
+            }, specific_bot_token=specific_bot_token)  # 传入 specific_bot_token
             logger.info("成功通过回退方案发送消息")
 
         except Exception as final_error:
@@ -521,12 +607,59 @@ async def send_with_prefix(source_chat_id, dest_chat_id, message_thread_id, send
             raise final_error
 
 
+async def _record_topic_failure_event(entity_id, entity_type, error_description):
+    """记录话题故障事件"""
+    try:
+        event_store = await get_failover_event_store()
+        event = FailoverEventRecord(
+            event_id=str(uuid.uuid4())[:8],
+            bot_id=f"{entity_type}_{entity_id}",  # 使用 entity_type_entity_id 作为 bot_id
+            event_type="topic_failure",
+            severity=EventSeverity.MEDIUM,
+            timestamp=time.time(),
+            description=f"话题故障: {error_description}",
+            metadata={
+                "entity_id": entity_id,
+                "entity_type": entity_type,
+                "error": error_description
+            }
+        )
+        await event_store.store_event(event)
+    except Exception as e:
+        logger.error(f"记录话题故障事件失败: {e}")
+
+
+async def _record_topic_recovery_event(entity_id, entity_type, new_topic_id):
+    """记录话题恢复事件"""
+    try:
+        event_store = await get_failover_event_store()
+        event = FailoverEventRecord(
+            event_id=str(uuid.uuid4())[:8],
+            bot_id=f"{entity_type}_{entity_id}",  # 使用 entity_type_entity_id 作为 bot_id
+            event_type="topic_recovery",
+            severity=EventSeverity.LOW,
+            timestamp=time.time(),
+            description=f"话题恢复成功，新话题ID: {new_topic_id}",
+            metadata={
+                "entity_id": entity_id,
+                "entity_type": entity_type,
+                "new_topic_id": new_topic_id
+            },
+            resolved=True,
+            resolution_time=time.time()
+        )
+        await event_store.store_event(event)
+    except Exception as e:
+        logger.error(f"记录话题恢复事件失败: {e}")
+
+
 # 为了向后兼容，保留原函数签名的包装器
-async def send_with_prefix_legacy(source_chat_id, dest_chat_id, message_thread_id, sender_name, msg):
-    """向后兼容的包装器"""
-    return await send_with_prefix(
-        source_chat_id, dest_chat_id, message_thread_id, sender_name, msg
-    )
+# NOTE: 移除这个包装器，直接修改send_with_prefix的调用处，或者在send_with_prefix内部处理
+# async def send_with_prefix_legacy(source_chat_id, dest_chat_id, message_thread_id, sender_name, msg):
+#     """向后兼容的包装器"""
+#     return await send_with_prefix(
+#         source_chat_id, dest_chat_id, message_thread_id, sender_name, msg
+#     )
 
 
 async def close_http_client():
@@ -557,3 +690,14 @@ async def switch_to_bot(bot_id: str):
             return f"找到机器人: {bot.config.name}"
         return f"未找到机器人: {bot_id}"
     return "多机器人模式未启用"
+
+
+async def get_failover_manager_instance():
+    """获取故障转移管理器实例"""
+    global _failover_manager
+    if _failover_manager is None and getattr(settings, 'MULTI_BOT_ENABLED', False):
+        try:
+            _failover_manager = await get_failover_manager()
+        except Exception as e:
+            logger.warning(f"无法获取故障转移管理器: {e}")
+    return _failover_manager

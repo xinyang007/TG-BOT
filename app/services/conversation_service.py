@@ -1,3 +1,5 @@
+# app/conversation_service.py
+
 import logging
 from datetime import datetime, timezone
 from peewee import DoesNotExist, PeeweeException, fn
@@ -5,7 +7,7 @@ from starlette.concurrency import run_in_threadpool
 from typing import Optional, Dict, Any
 
 from ..store import Conversation, Messages, BlackList, BindingID, get_current_utc_time
-from ..tg_utils import tg
+from ..tg_utils import tg as auto_tg  # 导入tg_utils中的主tg函数，它会进行机器人选择和故障转移
 from ..settings import settings
 from ..logging_config import get_logger
 from ..monitoring import (
@@ -35,11 +37,12 @@ MESSAGE_LIMIT_BEFORE_BIND = 10  # 绑定前消息数量限制
 
 class ConversationService:
     def __init__(self, support_group_id: str, external_group_ids: list[str], tg_func,
+                 # tg_func 已经不需要了，但在dependencies里还传着，暂时保留
                  cache_manager: Optional[CacheManager] = None,
                  metrics_collector: Optional[MetricsCollector] = None):
         self.support_group_id = support_group_id
         self.configured_external_group_ids = set(str(id) for id in external_group_ids)
-        self.tg = tg_func
+        self.tg_caller = auto_tg  # 直接使用 tg_utils.tg 作为内部的 API 调用者
         self.cache = cache_manager
         self.metrics = metrics_collector
         self.logger = get_logger("app.services.conversation")
@@ -53,6 +56,14 @@ class ConversationService:
                 "metrics_enabled": metrics_collector is not None
             }
         )
+
+    # tg_func property 和 setter 已经不再需要了，可以删除
+    # @property
+    # def tg_func(self):
+    #     return self._tg_func_for_messages
+    # @tg_func.setter
+    # def tg_func(self, func):
+    #     self._tg_func_for_messages = func
 
     def _build_topic_name(self, entity_name: str | None, entity_id: int | str, status: str,
                           is_verified: str = "pending") -> str:
@@ -159,10 +170,19 @@ class ConversationService:
 
         # 尝试从缓存获取
         if self.cache:
-            cached_conv = await self.cache.conversation_cache.get_conversation_by_entity(entity_id_int, entity_type)
-            if cached_conv:
+            cached_conv_dict = await self.cache.conversation_cache.get_conversation_by_entity(entity_id_int,
+                                                                                              entity_type)
+            if cached_conv_dict:
                 self.logger.debug(f"从缓存获取实体 {entity_type} ID {entity_id_int} 的对话记录")
-                return await self._dict_to_conversation(cached_conv)
+                # 将字典转换回一个临时的 Conversation 对象
+                conv = Conversation()
+                for key, value in cached_conv_dict.items():
+                    # 特殊处理 datetime 类型
+                    if key == "first_seen" and value:
+                        setattr(conv, key, datetime.fromisoformat(value))
+                    else:
+                        setattr(conv, key, value)
+                return conv
 
         try:
             def _get_conversation():
@@ -180,7 +200,18 @@ class ConversationService:
 
                 # 缓存结果
                 if self.cache:
-                    conv_dict = await self._conversation_to_dict(conv)
+                    conv_dict = {
+                        "entity_id": conv.entity_id,
+                        "entity_type": conv.entity_type,
+                        "topic_id": conv.topic_id,
+                        "status": conv.status,
+                        "lang": conv.lang,
+                        "entity_name": conv.entity_name,
+                        "custom_id": conv.custom_id,
+                        "is_verified": conv.is_verified,
+                        "message_count_before_bind": conv.message_count_before_bind,
+                        "first_seen": conv.first_seen.isoformat() if conv.first_seen else None
+                    }
                     await self.cache.conversation_cache.set_conversation_by_entity(
                         entity_id_int, entity_type, conv_dict
                     )
@@ -204,10 +235,17 @@ class ConversationService:
         """获取话题对话（带缓存）"""
         # 尝试从缓存获取
         if self.cache:
-            cached_conv = await self.cache.conversation_cache.get_conversation_by_topic(topic_id)
-            if cached_conv:
+            cached_conv_dict = await self.cache.conversation_cache.get_conversation_by_topic(topic_id)
+            if cached_conv_dict:
                 self.logger.debug(f"从缓存获取话题 {topic_id} 的对话记录")
-                return await self._dict_to_conversation(cached_conv)
+                # 将字典转换回一个临时的 Conversation 对象
+                conv = Conversation()
+                for key, value in cached_conv_dict.items():
+                    if key == "first_seen" and value:
+                        setattr(conv, key, datetime.fromisoformat(value))
+                    else:
+                        setattr(conv, key, value)
+                return conv
 
         try:
             def _get_conversation():
@@ -220,7 +258,18 @@ class ConversationService:
 
                 # 缓存结果
                 if self.cache:
-                    conv_dict = await self._conversation_to_dict(conv)
+                    conv_dict = {
+                        "entity_id": conv.entity_id,
+                        "entity_type": conv.entity_type,
+                        "topic_id": conv.topic_id,
+                        "status": conv.status,
+                        "lang": conv.lang,
+                        "entity_name": conv.entity_name,
+                        "custom_id": conv.custom_id,
+                        "is_verified": conv.is_verified,
+                        "message_count_before_bind": conv.message_count_before_bind,
+                        "first_seen": conv.first_seen.isoformat() if conv.first_seen else None
+                    }
                     await self.cache.conversation_cache.set_conversation_by_topic(topic_id, conv_dict)
             else:
                 self.logger.debug(f"未找到话题 ID {topic_id} 对应的对话")
@@ -232,35 +281,6 @@ class ConversationService:
             self.logger.error(f"数据库错误：获取话题 {topic_id} 对话失败: {e}", exc_info=True)
             record_database_operation("get_conversation_by_topic", 0, False)
             raise
-
-    async def _conversation_to_dict(self, conv: Conversation) -> Dict[str, Any]:
-        """将 Conversation 对象转换为字典"""
-        return {
-            "entity_id": conv.entity_id,
-            "entity_type": conv.entity_type,
-            "topic_id": conv.topic_id,
-            "status": conv.status,
-            "lang": conv.lang,
-            "entity_name": conv.entity_name,
-            "custom_id": conv.custom_id,
-            "is_verified": conv.is_verified,
-            "message_count_before_bind": conv.message_count_before_bind,
-            "first_seen": conv.first_seen.isoformat() if conv.first_seen else None
-        }
-
-    async def _dict_to_conversation(self, conv_dict: Dict[str, Any]) -> Conversation:
-        """将字典转换为 Conversation 对象"""
-        conv = Conversation()
-        conv.entity_id = conv_dict["entity_id"]
-        conv.entity_type = conv_dict["entity_type"]
-        conv.topic_id = conv_dict["topic_id"]
-        conv.status = conv_dict["status"]
-        conv.lang = conv_dict["lang"]
-        conv.entity_name = conv_dict["entity_name"]
-        conv.custom_id = conv_dict["custom_id"]
-        conv.is_verified = conv_dict["is_verified"]
-        conv.message_count_before_bind = conv_dict["message_count_before_bind"]
-        return conv
 
     @monitor_performance("create_initial_conversation_with_topic")
     async def create_initial_conversation_with_topic(self, entity_id: int | str, entity_type: str,
@@ -282,7 +302,8 @@ class ConversationService:
             topic_name = self._build_topic_name(entity_name, entity_id_int, "open", "pending")
             self.logger.info(f"为实体 {entity_type} ID {entity_id_int} 创建新话题，名称: '{topic_name}'")
             try:
-                topic_response = await self.tg("createForumTopic", {
+                # 使用 auto_tg (tg_utils.tg) 来创建话题，确保机器人选择和故障转移逻辑
+                topic_response = await self.tg_caller("createForumTopic", {
                     "chat_id": self.support_group_id,
                     "name": topic_name,
                 })
@@ -295,7 +316,8 @@ class ConversationService:
                 self.logger.info(f"成功创建话题 ID: {topic_id_to_use}")
                 record_telegram_api_call("createForumTopic", 0, True)
 
-                await self.tg("sendMessage", {
+                # 使用 tg_caller 发送欢迎消息，不指定 specific_bot_token，让 tg_caller 自行选择
+                await self.tg_caller("sendMessage", {
                     "chat_id": self.support_group_id,
                     "message_thread_id": topic_id_to_use,
                     "text": (
@@ -330,6 +352,7 @@ class ConversationService:
                     ).execute()
 
                 await run_in_threadpool(_update_conversation)
+                # 重新从数据库加载以确保获取到最新状态
                 conv = await self.get_conversation_by_entity(entity_id_int, entity_type)
                 self.logger.info(f"已更新实体 {entity_type} ID {entity_id_int} 的对话记录")
             else:
@@ -363,7 +386,8 @@ class ConversationService:
             return None
 
     @monitor_performance("close_conversation")
-    async def close_conversation(self, topic_id: int | None, entity_id: int | str, entity_type: str):
+    async def close_conversation(self, topic_id: int | None, entity_id: int | str, entity_type: str,
+                                 specific_bot_token: Optional[str] = None):
         """关闭对话"""
         try:
             def _get_conversation():
@@ -406,7 +430,8 @@ class ConversationService:
                         message_text = "此群组的客服对话已结束。"
 
                     if message_text:
-                        await self.tg("sendMessage", {"chat_id": entity_id, "text": message_text})
+                        await self.tg_caller("sendMessage", {"chat_id": entity_id, "text": message_text},
+                                             specific_bot_token=specific_bot_token)
                         record_telegram_api_call("sendMessage", 0, True)
                         self.logger.info(f"CLOSE_CONV: 已向实体发送关闭通知")
 
@@ -421,7 +446,8 @@ class ConversationService:
                         conv_entry.entity_name, entity_id, new_status, conv_entry.is_verified
                     )
                     try:
-                        await self.tg("editForumTopic", {
+                        # 使用 tg_caller 来更新话题名称，不指定 specific_bot_token
+                        await self.tg_caller("editForumTopic", {
                             "chat_id": self.support_group_id,
                             "message_thread_id": topic_to_update,
                             "name": topic_name
@@ -443,7 +469,7 @@ class ConversationService:
             raise
 
     @monitor_performance("ban_user")
-    async def ban_user(self, user_id: int | str):
+    async def ban_user(self, user_id: int | str, specific_bot_token: Optional[str] = None):
         """拉黑用户"""
         user_id_int = 0
         try:
@@ -461,7 +487,8 @@ class ConversationService:
             if existing_ban:
                 self.logger.info(f"BAN_USER: 用户 {user_id_int} 已经被拉黑")
                 try:
-                    await self.tg("sendMessage", {"chat_id": user_id_int, "text": "您已被禁止发起新的对话。"})
+                    await self.tg_caller("sendMessage", {"chat_id": user_id_int, "text": "您已被禁止发起新的对话。"},
+                                         specific_bot_token=specific_bot_token)
                     record_telegram_api_call("sendMessage", 0, True)
                 except Exception as e:
                     self.logger.warning(f"BAN_USER: 发送重复拉黑通知失败: {e}", exc_info=True)
@@ -481,7 +508,8 @@ class ConversationService:
                     await self.cache.conversation_cache.set_user_ban_status(user_id_int, True, 300)
 
                 try:
-                    await self.tg("sendMessage", {"chat_id": user_id_int, "text": "您已被禁止发起新的对话。"})
+                    await self.tg_caller("sendMessage", {"chat_id": user_id_int, "text": "您已被禁止发起新的对话。"},
+                                         specific_bot_token=specific_bot_token)
                     record_telegram_api_call("sendMessage", 0, True)
                     self.logger.info(f"BAN_USER: 已成功向用户 {user_id_int} 发送拉黑通知")
                 except Exception as e:
@@ -501,7 +529,7 @@ class ConversationService:
             raise
 
     @monitor_performance("unban_user")
-    async def unban_user(self, user_id_to_unban: int | str) -> bool:
+    async def unban_user(self, user_id_to_unban: int | str, specific_bot_token: Optional[str] = None) -> bool:
         """解除用户拉黑"""
         user_id_int = 0
         try:
@@ -525,7 +553,8 @@ class ConversationService:
 
                 message_text = "您的账号已被解除拉黑。现在可以继续发起新的对话了。"
                 try:
-                    await self.tg("sendMessage", {"chat_id": user_id_int, "text": message_text})
+                    await self.tg_caller("sendMessage", {"chat_id": user_id_int, "text": message_text},
+                                         specific_bot_token=specific_bot_token)
                     record_telegram_api_call("sendMessage", 0, True)
                     self.logger.info(f"UNBAN_USER: 已成功向用户 {user_id_int} 发送解除拉黑通知")
                 except Exception as e:
@@ -548,7 +577,8 @@ class ConversationService:
             return False
 
     @monitor_performance("reopen_conversation")
-    async def reopen_conversation(self, entity_id: int | str, entity_type: str, topic_id: int):
+    async def reopen_conversation(self, entity_id: int | str, entity_type: str, topic_id: int,
+                                  specific_bot_token: Optional[str] = None):
         """重新开启对话"""
         try:
             def _get_conversation():
@@ -599,7 +629,8 @@ class ConversationService:
                         message_text = "此群组的客服对话已重新开启。"
 
                     if message_text:
-                        await self.tg("sendMessage", {"chat_id": entity_id, "text": message_text})
+                        await self.tg_caller("sendMessage", {"chat_id": entity_id, "text": message_text},
+                                             specific_bot_token=specific_bot_token)
                         record_telegram_api_call("sendMessage", 0, True)
                         self.logger.info(f"REOPEN_CONV: 已向实体发送重开通知")
 
@@ -612,7 +643,8 @@ class ConversationService:
                     conv_entry.entity_name, entity_id, new_status, conv_entry.is_verified
                 )
                 try:
-                    await self.tg("editForumTopic", {
+                    # 使用 tg_caller 来更新话题名称，不指定 specific_bot_token
+                    await self.tg_caller("editForumTopic", {
                         "chat_id": self.support_group_id,
                         "message_thread_id": topic_id,
                         "name": topic_name
@@ -689,7 +721,8 @@ class ConversationService:
 
     @monitor_performance("bind_entity")
     async def bind_entity(self, entity_id: int | str, entity_type: str, entity_name: str | None,
-                          custom_id: str, password: str | None = None) -> bool:
+                          custom_id: str, password: str | None = None,
+                          specific_bot_token: Optional[str] = None) -> bool:
         """绑定实体"""
         entity_id_int = int(entity_id)
         try:
@@ -697,10 +730,10 @@ class ConversationService:
             conv: Conversation = await self.get_conversation_by_entity(entity_id_int, entity_type)
             if conv and conv.is_verified == 'verified':
                 self.logger.info(f"BIND_ENTITY: 实体 {entity_type} ID {entity_id_int} 已经绑定")
-                await self.tg("sendMessage", {
+                await self.tg_caller("sendMessage", {
                     "chat_id": entity_id_int,
                     "text": "您已经完成绑定，无需重复绑定。"
-                })
+                }, specific_bot_token=specific_bot_token)
                 record_telegram_api_call("sendMessage", 0, True)
                 return True
 
@@ -712,10 +745,10 @@ class ConversationService:
 
             if not binding_id_entry:
                 self.logger.warning(f"BIND_ENTITY: 自定义 ID '{custom_id}' 不存在")
-                await self.tg("sendMessage", {
+                await self.tg_caller("sendMessage", {
                     "chat_id": entity_id_int,
                     "text": f"绑定失败：自定义 ID '{custom_id}' 无效或未被授权。"
-                })
+                }, specific_bot_token=specific_bot_token)
                 record_telegram_api_call("sendMessage", 0, True)
                 return False
 
@@ -723,18 +756,18 @@ class ConversationService:
             if binding_id_entry.password_hash:
                 if not password:
                     self.logger.warning(f"BIND_ENTITY: ID '{custom_id}' 需要密码，但用户未提供")
-                    await self.tg("sendMessage", {
+                    await self.tg_caller("sendMessage", {
                         "chat_id": entity_id_int,
                         "text": f"绑定失败：此自定义 ID 需要密码。请使用 `/bind {custom_id} <密码>`"
-                    })
+                    }, specific_bot_token=specific_bot_token)
                     record_telegram_api_call("sendMessage", 0, True)
                     return False
                 if not binding_id_entry.check_password(password):
                     self.logger.warning(f"BIND_ENTITY: ID '{custom_id}' 密码错误")
-                    await self.tg("sendMessage", {
+                    await self.tg_caller("sendMessage", {
                         "chat_id": entity_id_int,
                         "text": f"绑定失败：密码错误。"
-                    })
+                    }, specific_bot_token=specific_bot_token)
                     record_telegram_api_call("sendMessage", 0, True)
                     return False
                 self.logger.info(f"BIND_ENTITY: ID '{custom_id}' 密码校验通过")
@@ -752,18 +785,18 @@ class ConversationService:
                         existing_conv_for_custom_id.entity_id == entity_id_int and
                         existing_conv_for_custom_id.entity_type == entity_type):
                     self.logger.info(f"BIND_ENTITY: 实体 {entity_type} ID {entity_id_int} 已绑定到 '{custom_id}'")
-                    await self.tg("sendMessage", {
+                    await self.tg_caller("sendMessage", {
                         "chat_id": entity_id_int,
                         "text": f"您已成功绑定到自定义 ID '{custom_id}'。"
-                    })
+                    }, specific_bot_token=specific_bot_token)
                     record_telegram_api_call("sendMessage", 0, True)
                     return True
                 else:
                     self.logger.warning(f"BIND_ENTITY: 自定义 ID '{custom_id}' 已被其他实体使用")
-                    await self.tg("sendMessage", {
+                    await self.tg_caller("sendMessage", {
                         "chat_id": entity_id_int,
                         "text": f"绑定失败：自定义 ID '{custom_id}' 已被其他用户绑定。"
-                    })
+                    }, specific_bot_token=specific_bot_token)
                     record_telegram_api_call("sendMessage", 0, True)
                     return False
 
@@ -773,10 +806,10 @@ class ConversationService:
             if (conv and conv.is_verified == 'verified' and
                     conv.custom_id != custom_id and conv.custom_id is not None):
                 self.logger.warning(f"BIND_ENTITY: 实体已验证并绑定到其他 ID ({conv.custom_id})")
-                await self.tg("sendMessage", {
+                await self.tg_caller("sendMessage", {
                     "chat_id": entity_id_int,
                     "text": "您已绑定到另一个自定义 ID。如需更改，请联系管理员。"
-                })
+                }, specific_bot_token=specific_bot_token)
                 record_telegram_api_call("sendMessage", 0, True)
                 return False
 
@@ -798,17 +831,18 @@ class ConversationService:
 
             if not topic_id_to_use:
                 self.logger.info(f"BIND_ENTITY: 创建新话题")
-                topic_response = await self.tg("createForumTopic", {
+                # 使用 tg_caller (tg_utils.tg) 来创建话题，不指定 specific_bot_token
+                topic_response = await self.tg_caller("createForumTopic", {
                     "chat_id": self.support_group_id,
                     "name": topic_name
                 })
                 topic_id_to_use = topic_response.get("message_thread_id")
                 if not topic_id_to_use:
                     self.logger.error(f"BIND_ENTITY: 创建客服话题失败。响应: {topic_response}")
-                    await self.tg("sendMessage", {
+                    await self.tg_caller("sendMessage", {
                         "chat_id": entity_id_int,
                         "text": "绑定失败：无法创建客服通道。"
-                    })
+                    }, specific_bot_token=specific_bot_token)
                     record_telegram_api_call("createForumTopic", 0, False)
                     record_telegram_api_call("sendMessage", 0, True)
                     return False
@@ -818,7 +852,8 @@ class ConversationService:
             else:
                 self.logger.info(f"BIND_ENTITY: 编辑现有话题 {topic_id_to_use}")
                 try:
-                    await self.tg("editForumTopic", {
+                    # 使用 tg_caller 来编辑话题名称，不指定 specific_bot_token
+                    await self.tg_caller("editForumTopic", {
                         "chat_id": self.support_group_id,
                         "message_thread_id": topic_id_to_use,
                         "name": topic_name
@@ -880,21 +915,21 @@ class ConversationService:
             self.logger.info(f"BIND_ENTITY: 自定义 ID '{custom_id}' 状态更新为 'used'")
 
             # 通知实体和客服话题
-            await self.tg("sendMessage", {
+            await self.tg_caller("sendMessage", {
                 "chat_id": entity_id_int,
                 "text": f"恭喜！您已成功绑定到自定义 ID '{custom_id}'。现在您可以发送消息与客服沟通了。"
-            })
+            }, specific_bot_token=specific_bot_token)
             record_telegram_api_call("sendMessage", 0, True)
 
             try:
-                await self.tg("sendMessage", {
+                await self.tg_caller("sendMessage", {
                     "chat_id": self.support_group_id,
                     "message_thread_id": topic_id_to_use,
                     "text": (
                         f"对话已成功验证并绑定。\n实体类型: {entity_type}\n实体ID: {entity_id_int}\n"
                         f"实体名称: {entity_name_for_topic or 'N/A'}\n自定义ID: {custom_id}"
                     )
-                })
+                }, specific_bot_token=specific_bot_token)  # 传入 specific_bot_token
                 record_telegram_api_call("sendMessage", 0, True)
             except Exception as e_topic_msg:
                 self.logger.warning(f"BIND_ENTITY: 在客服话题中发送绑定成功消息失败: {e_topic_msg}")
@@ -905,19 +940,19 @@ class ConversationService:
 
         except PeeweeException as e:
             self.logger.error(f"BIND_ENTITY: 数据库错误：绑定失败: {e}", exc_info=True)
-            await self.tg("sendMessage", {
+            await self.tg_caller("sendMessage", {
                 "chat_id": entity_id_int,
                 "text": "绑定过程中发生数据库错误，请稍后重试。"
-            })
+            }, specific_bot_token=specific_bot_token)
             record_database_operation("bind_entity", 0, False)
             record_telegram_api_call("sendMessage", 0, True)
             return False
         except Exception as e:
             self.logger.error(f"BIND_ENTITY: 意外错误：绑定失败: {e}", exc_info=True)
-            await self.tg("sendMessage", {
+            await self.tg_caller("sendMessage", {
                 "chat_id": entity_id_int,
                 "text": "绑定过程中发生意外错误，请联系管理员。"
-            })
+            }, specific_bot_token=specific_bot_token)
             record_telegram_api_call("sendMessage", 0, True)
             return False
 

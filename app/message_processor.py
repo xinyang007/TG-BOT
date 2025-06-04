@@ -1,3 +1,5 @@
+# app/message_processor.py
+
 import asyncio
 import time
 from typing import Dict, Any, Optional
@@ -8,7 +10,9 @@ from .validation import validate_webhook_update, validate_telegram_message, Vali
 from .monitoring import record_message_processing
 from .handlers import private, group
 from .settings import settings
-from .tg_utils import tg_with_specific_bot
+
+# from .tg_utils import tg_with_specific_bot # 这个导入现在不需要了，因为我们直接用 tg_utils.tg
+
 
 logger = get_logger("app.message_processor")
 
@@ -43,6 +47,17 @@ class MessageProcessor:
         """
         start_time = time.time()
         bot_id = bot_instance.bot_id if bot_instance else None
+        specific_bot_token = bot_instance.config.token if bot_instance else None  # 获取具体的bot token
+
+        if not specific_bot_token:
+            self.logger.error(f"消息 {queued_msg.message_id} 没有有效的机器人Token，无法处理。")
+            return ProcessingResult(
+                success=False,
+                error_message="No valid bot token",
+                processing_time=time.time() - start_time,
+                bot_id=bot_id,
+                retry_recommended=False
+            )
 
         try:
             # 验证消息格式
@@ -65,7 +80,7 @@ class MessageProcessor:
             msg_data = validated_update.get_message()
             if not msg_data:
                 return ProcessingResult(
-                    success=True,  # 不是错误，只是跳过
+                    success=True,
                     error_message="非消息类型更新",
                     processing_time=time.time() - start_time,
                     bot_id=bot_id
@@ -106,29 +121,32 @@ class MessageProcessor:
                     "chat_type": chat_type,
                     "user_id": user_id,
                     "user_name": user_name,
-                    "bot_id": bot_id
+                    "bot_id": bot_id,
+                    "specific_bot_token_used": specific_bot_token  # 添加此日志
                 }
             )
 
-            # 临时设置当前机器人token（如果需要）
-            original_tg_func = None
-            if bot_instance:
-                original_tg_func = self._setup_bot_context(bot_instance)
+            # **核心修改点：将 specific_bot_token 传递给 handle_private/handle_group**
+            # 这要求 private.py 和 group.py 中的 handle_private/handle_group 签名修改
+            # 它们再将此 token 传递给 conversation_service 的相关方法
+            # conversation_service 的方法再传递给 tg_utils.tg
 
             try:
-                # 根据聊天类型处理消息
                 if chat_type == "private":
-                    await private.handle_private(msg_data, self.conversation_service)
+                    await private.handle_private(msg_data, self.conversation_service,
+                                                 specific_bot_token=specific_bot_token)
                     record_message_processing("private", time.time() - start_time, True)
                     msg_logger.info("私聊消息处理完成")
 
                 elif chat_type in ("group", "supergroup"):
                     if str(chat_id) == settings.SUPPORT_GROUP_ID:
-                        await group.handle_group(msg_data, self.conversation_service)
+                        await group.handle_group(msg_data, self.conversation_service,
+                                                 specific_bot_token=specific_bot_token)
                         record_message_processing("support_group", time.time() - start_time, True)
                         msg_logger.info("客服群组消息处理完成")
                     else:
-                        await group.handle_group(msg_data, self.conversation_service)
+                        await group.handle_group(msg_data, self.conversation_service,
+                                                 specific_bot_token=specific_bot_token)
                         record_message_processing("external_group", time.time() - start_time, True)
                         msg_logger.info("外部群组消息处理完成")
                 else:
@@ -140,7 +158,6 @@ class MessageProcessor:
                         bot_id=bot_id
                     )
 
-                # 成功处理
                 return ProcessingResult(
                     success=True,
                     processing_time=time.time() - start_time,
@@ -148,19 +165,16 @@ class MessageProcessor:
                 )
 
             finally:
-                # 恢复原始上下文
-                if original_tg_func:
-                    self._restore_bot_context(original_tg_func)
+                # 之前在这里恢复 tg_func 的代码块，现在可以完全移除
+                pass
 
         except Exception as processing_error:
-            # 处理异常
             self.logger.error(
                 f"消息 {queued_msg.message_id} 处理异常",
                 extra={"processing_error": str(processing_error)},
                 exc_info=True
             )
 
-            # 判断是否应该重试
             retry_recommended = self._should_retry_error(processing_error)
 
             record_message_processing(
@@ -177,38 +191,23 @@ class MessageProcessor:
                 retry_recommended=retry_recommended
             )
 
-    def _setup_bot_context(self, bot_instance):
-        """设置机器人上下文（如果需要特定机器人处理）"""
-        # 这里可以临时替换全局的tg函数，使其使用特定机器人
-        # 返回原始函数以便恢复
-
-        # 由于tg_utils已经有了机器人选择逻辑，这里可能不需要特殊处理
-        # 但如果需要强制使用特定机器人，可以在这里实现
-
-        return None
-
-    def _restore_bot_context(self, original_func):
-        """恢复原始机器人上下文"""
-        # 恢复原始函数
-        pass
-
     def _should_retry_error(self, error: Exception) -> bool:
-        """判断错误是否应该重试"""
         error_str = str(error).lower()
 
-        # 网络相关错误可以重试
-        if any(keyword in error_str for keyword in ['timeout', 'connection', 'network']):
+        if any(keyword in error_str for keyword in ['timeout', 'connection', 'network', 'httpx']):
             return True
 
-        # 429限速错误可以重试
         if '429' in error_str or 'too many requests' in error_str:
             return True
 
-        # 临时服务错误可以重试
         if any(keyword in error_str for keyword in ['502', '503', '504', 'service unavailable']):
             return True
 
-        # 其他错误通常不需要重试
+        if any(keyword in error_str for keyword in
+               ['topic_deleted', 'thread not found', 'message thread not found', 'topic not found',
+                'forum topic not found']):
+            return False
+
         return False
 
 
@@ -221,17 +220,7 @@ class CoordinatedMessageHandler:
         self.logger = get_logger("app.coordinated_handler")
 
     async def handle_webhook_message(self, raw_update: Dict[str, Any]) -> str:
-        """
-        处理Webhook消息的入口点
-
-        Args:
-            raw_update: 原始的Telegram更新数据
-
-        Returns:
-            str: 处理结果状态
-        """
         try:
-            # 通过消息协调器协调处理
             success = await self.message_coordinator.coordinate_message(raw_update)
 
             if success:
@@ -246,35 +235,17 @@ class CoordinatedMessageHandler:
             return "coordination_error"
 
     async def process_queued_message(self, queued_msg, bot_instance) -> ProcessingResult:
-        """
-        处理队列中的消息 - 由消息协调器调用
-
-        Args:
-            queued_msg: 队列中的消息对象
-            bot_instance: 分配的机器人实例
-
-        Returns:
-            ProcessingResult: 处理结果
-        """
-        return await self.message_processor.process_message(queued_msg, bot_instance)
-
-
-# 工厂函数和依赖注入辅助
+        result = await self.message_processor.process_message(queued_msg, bot_instance)
+        _processing_stats.record_processing(result)
+        return result
 
 
 async def create_coordinated_handler(conversation_service):
-    """创建协调式消息处理器"""
     from .message_coordinator import get_message_coordinator
 
-    # 获取消息协调器
     coordinator = await get_message_coordinator()
-
-    # 创建协调式处理器
     handler = CoordinatedMessageHandler(coordinator, conversation_service)
-
-    # 集成处理逻辑到协调器
-    coordinator._execute_message_processing = handler.process_queued_message
-
+    coordinator._message_processor_callback = handler.process_queued_message
     return handler
 
 
@@ -286,10 +257,9 @@ class MessageProcessingStats:
         self.failed_count = 0
         self.total_processing_time = 0.0
         self.last_processed = None
-        self.bot_usage = {}  # 记录每个机器人的使用情况
+        self.bot_usage = {}
 
     def record_processing(self, result: ProcessingResult):
-        """记录处理结果"""
         if result.success:
             self.processed_count += 1
         else:
@@ -310,7 +280,6 @@ class MessageProcessingStats:
             self.bot_usage[result.bot_id]["total_time"] += result.processing_time
 
     def get_stats(self) -> Dict[str, Any]:
-        """获取统计信息"""
         total_count = self.processed_count + self.failed_count
         success_rate = (self.processed_count / total_count * 100) if total_count > 0 else 0
         avg_processing_time = (self.total_processing_time / total_count) if total_count > 0 else 0
@@ -327,10 +296,8 @@ class MessageProcessingStats:
         }
 
 
-# 全局统计实例
 _processing_stats = MessageProcessingStats()
 
 
 def get_processing_stats() -> MessageProcessingStats:
-    """获取全局处理统计"""
     return _processing_stats

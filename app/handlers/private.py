@@ -1,8 +1,11 @@
+# app/handlers/private.py
+
 from starlette.concurrency import run_in_threadpool
+from typing import Optional
 
 from ..settings import settings
 from ..store import Conversation
-from ..tg_utils import tg, send_with_prefix
+from ..tg_utils import tg, send_with_prefix # 确保tg导入
 from ..services.conversation_service import ConversationService, MESSAGE_LIMIT_BEFORE_BIND
 from ..logging_config import get_user_logger, get_logger
 from ..validation import validate_bind_command, ValidationError, UserInput
@@ -13,7 +16,7 @@ logger = get_logger("app.handlers.private")
 
 
 @monitor_performance("handle_private_message")
-async def handle_private(msg: dict, conv_service: ConversationService):
+async def handle_private(msg: dict, conv_service: ConversationService, specific_bot_token: Optional[str] = None):
     """处理用户发来的私聊消息"""
     # 基本信息提取和验证
     uid = msg["from"]["id"]
@@ -42,7 +45,8 @@ async def handle_private(msg: dict, conv_service: ConversationService):
             "message_id": message_id,
             "message_type": "command" if raw_text_content.startswith("/") else "text",
             "is_start": is_start_command,
-            "is_bind": is_bind_command or is_bind_command_alone
+            "is_bind": is_bind_command or is_bind_command_alone,
+            "specific_bot_token_present": specific_bot_token is not None
         }
     )
 
@@ -61,21 +65,21 @@ async def handle_private(msg: dict, conv_service: ConversationService):
             await tg("sendMessage", {
                 "chat_id": uid,
                 "text": "消息格式有误，请重新发送。"
-            })
+            }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
         except Exception:
             pass
         return
 
     # --- 2. 检查拉黑状态 ---
     try:
-        is_banned = await conv_service.is_user_banned(uid)
+        is_banned = await conv_service.is_user_banned(uid) # is_user_banned 不直接发消息，无需token
         if is_banned:
             user_logger.info("用户被拉黑，停止处理")
             try:
                 await tg("sendMessage", {
                     "chat_id": uid,
                     "text": "您当前无法发起新的对话。"
-                })
+                }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
             except Exception as e:
                 user_logger.warning("发送拉黑通知失败", extra={"error": str(e)})
             return
@@ -85,7 +89,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
             await tg("sendMessage", {
                 "chat_id": uid,
                 "text": "服务器错误，请稍后再试。"
-            })
+            }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
         except Exception:
             pass
         return
@@ -99,7 +103,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
             await tg("sendMessage", {
                 "chat_id": uid,
                 "text": "获取对话状态失败，请稍后再试。"
-            })
+            }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
         except Exception:
             pass
         return
@@ -114,7 +118,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 await tg("sendMessage", {
                     "chat_id": uid,
                     "text": "您已经完成绑定，无需重复绑定。"
-                })
+                }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
             except Exception as e:
                 user_logger.error("发送已绑定消息失败", exc_info=True)
         else:
@@ -130,7 +134,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 await tg("sendMessage", {
                     "chat_id": uid,
                     "text": message_text
-                })
+                }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
             except Exception as e:
                 user_logger.error("发送绑定引导消息失败", exc_info=True)
         return
@@ -156,7 +160,8 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 entity_type='user',
                 entity_name=user_first_name,
                 custom_id=bind_cmd.custom_id,
-                password=bind_cmd.password
+                password=bind_cmd.password,
+                specific_bot_token=specific_bot_token # 传递 specific_bot_token
             )
 
             user_logger.info(
@@ -185,8 +190,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 await tg("sendMessage", {
                     "chat_id": uid,
                     "text": error_text
-                    # 移除 parse_mode 避免格式解析错误
-                })
+                }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
             except Exception as send_error:
                 user_logger.error("发送绑定错误消息失败", exc_info=True)
         except Exception as e:
@@ -195,7 +199,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 await tg("sendMessage", {
                     "chat_id": uid,
                     "text": "绑定过程中发生错误，请稍后重试或联系管理员。"
-                })
+                }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
             except Exception:
                 pass
         return
@@ -206,14 +210,15 @@ async def handle_private(msg: dict, conv_service: ConversationService):
         try:
             conv = await conv_service.create_initial_conversation_with_topic(
                 uid, 'user', user_first_name
-            )
+            ) # create_initial_conversation_with_topic 内部会使用 tg_caller，无需额外传递 specific_bot_token
+
             if not conv or not conv.topic_id:
                 user_logger.error("创建初始对话失败")
                 try:
                     await tg("sendMessage", {
                         "chat_id": uid,
                         "text": "无法开始对话，请稍后再试或联系管理员。"
-                    })
+                    }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
                 except Exception:
                     pass
                 return
@@ -227,7 +232,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                         f"为了更好地为您服务，请尽快使用 /bind <后台ID> [密码] 命令完成身份绑定。\n"
                         f"在绑定前，您最多可以发送 {MESSAGE_LIMIT_BEFORE_BIND} 条消息。"
                     )
-                })
+                }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
             except Exception as e:
                 user_logger.warning("发送欢迎消息失败", extra={"error": str(e)})
 
@@ -237,7 +242,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 await tg("sendMessage", {
                     "chat_id": uid,
                     "text": "创建对话失败，请稍后重试。"
-                })
+                }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
             except Exception:
                 pass
             return
@@ -248,12 +253,12 @@ async def handle_private(msg: dict, conv_service: ConversationService):
         try:
             new_count, limit_reached = await conv_service.increment_message_count_and_check_limit(
                 conv.entity_id, conv.entity_type
-            )
+            ) # 这个方法不发送消息，无需 specific_bot_token
 
             if limit_reached:
                 user_logger.warning("未验证对话达到消息限制")
                 await conv_service.close_conversation(
-                    conv.topic_id, conv.entity_id, conv.entity_type
+                    conv.topic_id, conv.entity_id, conv.entity_type, specific_bot_token=specific_bot_token # 传递 specific_bot_token
                 )
                 try:
                     await tg("sendMessage", {
@@ -262,7 +267,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                             f"您的未验证对话已达到消息限制 ({MESSAGE_LIMIT_BEFORE_BIND}条)，"
                             f"对话已关闭。请先完成绑定：/bind <您的自定义ID>"
                         )
-                    })
+                    }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
                 except Exception:
                     pass
                 return
@@ -275,7 +280,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                                 f"您的对话仍需绑定。请发送 /bind <您的自定义ID>。"
                                 f" ({new_count}/{MESSAGE_LIMIT_BEFORE_BIND} 条消息)"
                             )
-                        })
+                        }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
                     except Exception:
                         pass
 
@@ -289,7 +294,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
             user_logger.info("重新开启已关闭的对话")
             try:
                 await conv_service.reopen_conversation(
-                    conv.entity_id, conv.entity_type, conv.topic_id
+                    conv.entity_id, conv.entity_type, conv.topic_id, specific_bot_token=specific_bot_token # 传递 specific_bot_token
                 )
                 conv.status = "open"
             except Exception as e:
@@ -298,7 +303,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                     await tg("sendMessage", {
                         "chat_id": uid,
                         "text": "无法重新开启对话，请稍后再试。"
-                    })
+                    }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
                 except Exception:
                     pass
                 return
@@ -310,7 +315,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                         await tg("sendMessage", {
                             "chat_id": uid,
                             "text": "您的对话已关闭但尚未绑定。请使用 /bind <您的自定义ID>。"
-                        })
+                        }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
                     except Exception:
                         pass
                 else:
@@ -318,7 +323,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                         await tg("sendMessage", {
                             "chat_id": uid,
                             "text": "您的上一个对话已关闭。发送消息即可开启新对话。"
-                        })
+                        }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
                     except Exception:
                         pass
                 return
@@ -334,10 +339,11 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                     message_thread_id=conv.topic_id,
                     sender_name=user_first_name,
                     msg=msg,
-                    conversation_service=conv_service,  # 添加这个参数
-                    entity_id=uid,  # 添加这个参数
-                    entity_type='user',  # 添加这个参数
-                    entity_name=user_first_name  # 添加这个参数
+                    conversation_service=conv_service,
+                    entity_id=uid,
+                    entity_type='user',
+                    entity_name=user_first_name,
+                    specific_bot_token=specific_bot_token # 传递 specific_bot_token
                 )
                 user_logger.info(
                     "消息转发成功",
@@ -349,7 +355,7 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                     await tg("sendMessage", {
                         "chat_id": uid,
                         "text": "消息发送失败，请稍后再试。"
-                    })
+                    }, specific_bot_token=specific_bot_token) # 传递 specific_bot_token
                 except Exception:
                     pass
 

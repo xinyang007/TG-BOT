@@ -1,3 +1,5 @@
+# app/bot_manager.py
+
 import time
 import asyncio
 import uuid
@@ -9,11 +11,8 @@ import json
 # 条件导入以避免循环依赖
 if TYPE_CHECKING:
     from .settings import BotConfig
-
-try:
     import redis.asyncio as redis
-except ImportError:
-    redis = None
+    from .failover_manager import FailoverManager, FailoverReason # 这里的FailoverReason只用于类型检查，运行时不会导入
 
 from .logging_config import get_logger
 
@@ -42,25 +41,37 @@ class BotInstance:
     last_request_time: float = field(default_factory=time.time)
     health_check_count: int = 0
     consecutive_failures: int = 0
+    health_score:int = 100
 
     def to_dict(self) -> Dict:
-        """转换为字典"""
-        return {
-            "bot_id": self.bot_id,
-            "token_preview": self.config.token[:10] + "..." if self.config.token else "",
-            "name": self.config.name,
-            "priority": self.config.priority,
-            "enabled": self.config.enabled,
-            "status": self.status.value,
-            "last_heartbeat": self.last_heartbeat,
-            "last_error": self.last_error,
-            "rate_limit_reset_time": self.rate_limit_reset_time,
-            "request_count": self.request_count,
-            "last_request_time": self.last_request_time,
-            "health_check_count": self.health_check_count,
-            "consecutive_failures": self.consecutive_failures,
-            "max_requests_per_minute": self.config.max_requests_per_minute
-        }
+        """转换为字典 - 防循环引用版本"""
+        try:
+            config_info = {
+                "name": getattr(self.config, 'name', 'Unknown') if hasattr(self,
+                                                                           'config') and self.config else 'Unknown',
+                "enabled": getattr(self.config, 'enabled', True) if hasattr(self, 'config') and self.config else True,
+                "priority": getattr(self.config, 'priority', 1) if hasattr(self, 'config') and self.config else 1,
+            }
+
+            status_value = self.status.value if hasattr(self.status, 'value') else str(self.status)
+
+            return {
+                "bot_id": str(self.bot_id),
+                "config": config_info,
+                "status": status_value,
+                "health_score": getattr(self, 'health_score', 100),
+                "request_count": getattr(self, 'request_count', 0),
+                "consecutive_failures": getattr(self, 'consecutive_failures', 0),
+                "last_request_time": getattr(self, 'last_request_time', 0),
+                "last_heartbeat": getattr(self, 'last_heartbeat', 0),
+                "last_error": getattr(self, 'last_error', None),
+            }
+        except Exception as e:
+            return {
+                "bot_id": str(getattr(self, 'bot_id', 'unknown')),
+                "status": "serialization_error",
+                "error": str(e)[:100],
+            }
 
     def is_available(self) -> bool:
         """检查机器人是否可用"""
@@ -73,9 +84,12 @@ class BotInstance:
         if self.status == BotStatus.RATE_LIMITED:
             if self.rate_limit_reset_time and time.time() < self.rate_limit_reset_time:
                 return False
+            return False
 
-        # 检查请求频率限制
+            # 检查请求频率限制
         if self._is_request_rate_limited():
+            self.logger.debug(
+                f"Bot {self.bot_id} is internally rate limited. Request count: {self.request_count}, Max: {self.config.max_requests_per_minute}, Time since last request: {time.time() - self.last_request_time:.1f}s")
             return False
 
         return self.status in [BotStatus.HEALTHY, BotStatus.UNKNOWN]
@@ -129,6 +143,7 @@ class BotManager:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._status_check_task: Optional[asyncio.Task] = None
         self._running = False
+        self._failover_manager: Optional['FailoverManager'] = None # 用于持有FailoverManager的引用
 
         # 延迟初始化机器人实例（避免循环导入）
         self._initialize_bots()
@@ -141,9 +156,11 @@ class BotManager:
 
             enabled_bots = settings.get_enabled_bots()
             for i, bot_config in enumerate(enabled_bots):
-                bot_id = f"bot_{i + 1}_{self.instance_id}"
-                self.bots[bot_id] = BotInstance(
-                    bot_id=bot_id,
+                # 为每个机器人实例生成一个唯一的bot_id
+                # 尽量让bot_id保持稳定，但允许根据实例ID区分
+                stable_bot_id = f"bot_{i + 1}_{bot_config.name.replace(' ', '_')}"
+                self.bots[stable_bot_id] = BotInstance(
+                    bot_id=stable_bot_id,
                     config=bot_config,
                     status=BotStatus.UNKNOWN
                 )
@@ -156,6 +173,18 @@ class BotManager:
 
         except Exception as e:
             self.logger.error(f"初始化机器人失败: {e}", exc_info=True)
+
+    async def _get_failover_manager(self) -> Optional['FailoverManager']:
+        """延迟获取故障转移管理器实例，避免循环依赖"""
+        if self._failover_manager is None:
+            try:
+                # 延迟导入，因为FailoverManager也可能需要BotManager
+                # 这里通过get_failover_manager函数获取全局单例
+                from .failover_manager import get_failover_manager
+                self._failover_manager = await get_failover_manager()
+            except Exception as e:
+                self.logger.warning(f"无法获取故障转移管理器: {e}")
+        return self._failover_manager
 
     async def start(self):
         """启动机器人管理器"""
@@ -203,6 +232,14 @@ class BotManager:
 
     async def _check_bot_health(self, bot: BotInstance) -> bool:
         """检查机器人健康状态"""
+        from .failover_manager import FailoverReason
+
+        current_status = bot.status
+        is_healthy = False  # 🔥 关键修复：在方法开始时初始化
+        error_msg = None
+        failover_reason = None
+
+        current_status = bot.status
         try:
             # 导入httpx客户端
             from .tg_utils import client as http_client
@@ -213,6 +250,9 @@ class BotManager:
             bot.health_check_count += 1
 
             response = await http_client.get(url, timeout=10)
+            is_healthy = False
+            error_msg = None
+            failover_reason = None
 
             if response.status_code == 200:
                 result = response.json()
@@ -221,19 +261,15 @@ class BotManager:
                     bot.last_error = None
                     bot.last_heartbeat = time.time()
                     bot.consecutive_failures = 0
-                    await self._save_bot_status(bot)
-
+                    is_healthy = True
                     self.logger.debug(f"机器人 {bot.bot_id} ({bot.config.name}) 健康检查成功")
-                    return True
                 else:
                     error_msg = result.get("description", "API返回ok=false")
                     bot.status = BotStatus.ERROR
                     bot.last_error = error_msg
                     bot.consecutive_failures += 1
-                    await self._save_bot_status(bot)
-
+                    failover_reason = FailoverReason.API_ERROR
                     self.logger.warning(f"机器人 {bot.bot_id} API错误: {error_msg}")
-                    return False
 
             elif response.status_code == 429:
                 # 处理429限速
@@ -247,20 +283,16 @@ class BotManager:
                 bot.rate_limit_reset_time = time.time() + retry_after_int
                 bot.last_error = f"Rate limited, retry after {retry_after_int}s"
                 bot.consecutive_failures += 1
-                await self._save_bot_status(bot)
-
+                failover_reason = FailoverReason.RATE_LIMITED
                 self.logger.warning(f"机器人 {bot.bot_id} 被限速，{retry_after_int}秒后重试")
-                return False
 
             elif response.status_code == 401:
                 # Token无效
                 bot.status = BotStatus.ERROR
                 bot.last_error = "Invalid bot token (401 Unauthorized)"
                 bot.consecutive_failures += 1
-                await self._save_bot_status(bot)
-
+                failover_reason = FailoverReason.API_ERROR
                 self.logger.error(f"机器人 {bot.bot_id} Token无效")
-                return False
 
             else:
                 # 其他HTTP错误
@@ -268,28 +300,35 @@ class BotManager:
                 bot.status = BotStatus.ERROR
                 bot.last_error = f"HTTP {response.status_code}: {error_text}"
                 bot.consecutive_failures += 1
-                await self._save_bot_status(bot)
-
+                failover_reason = FailoverReason.API_ERROR
                 self.logger.error(f"机器人 {bot.bot_id} HTTP错误 {response.status_code}: {error_text}")
-                return False
 
         except asyncio.TimeoutError:
             bot.status = BotStatus.ERROR
             bot.last_error = "Health check timeout"
             bot.consecutive_failures += 1
-            await self._save_bot_status(bot)
-
+            failover_reason = FailoverReason.TIMEOUT
             self.logger.warning(f"机器人 {bot.bot_id} 健康检查超时")
-            return False
 
         except Exception as e:
             bot.status = BotStatus.ERROR
             bot.last_error = str(e)[:100]
             bot.consecutive_failures += 1
-            await self._save_bot_status(bot)
-
+            failover_reason = FailoverReason.CONNECTION_ERROR # 假设是连接问题
             self.logger.error(f"机器人 {bot.bot_id} 健康检查异常: {e}", exc_info=True)
-            return False
+        finally:
+            await self._save_bot_status(bot)
+            # 通知故障转移管理器
+            failover_manager = await self._get_failover_manager()
+            if failover_manager:
+                if is_healthy:
+                    await failover_manager.handle_bot_recovery(bot.bot_id)
+                elif bot.status != current_status and failover_reason:
+                    # 仅在状态实际变化且有明确故障原因时才通知
+                    await failover_manager.handle_bot_failure(
+                        bot.bot_id, failover_reason, bot.last_error
+                    )
+            return is_healthy
 
     async def _save_bot_status(self, bot: BotInstance):
         """保存机器人状态到Redis"""
@@ -336,6 +375,7 @@ class BotManager:
 
     async def _status_check_loop(self):
         """状态检查循环"""
+        from .settings import settings # 延迟导入
         while self._running:
             try:
                 current_time = time.time()
@@ -354,17 +394,18 @@ class BotManager:
                         self.logger.info(f"尝试恢复被限速的机器人 {bot.bot_id}")
                         await self._check_bot_health(bot)
 
-                    # 定期健康检查（每5分钟检查一次健康的机器人，更频繁检查有问题的）
-                    elif bot.status == BotStatus.HEALTHY:
-                        if current_time - bot.last_heartbeat > 300:  # 5分钟
+                    # 定期健康检查（根据设置的间隔检查）
+                    health_check_interval = settings.BOT_HEALTH_CHECK_INTERVAL
+                    if bot.status == BotStatus.HEALTHY:
+                        if current_time - bot.last_heartbeat > health_check_interval:
                             await self._check_bot_health(bot)
                     elif bot.status in [BotStatus.UNKNOWN, BotStatus.ERROR]:
                         # 错误状态的机器人更频繁检查，但有退避机制
-                        backoff_time = min(60 * (2 ** min(bot.consecutive_failures, 5)), 3600)  # 最长1小时
+                        backoff_time = min(health_check_interval * (2 ** min(bot.consecutive_failures, 5)), 3600)  # 最长1小时
                         if current_time - bot.last_heartbeat > backoff_time:
                             await self._check_bot_health(bot)
 
-                await asyncio.sleep(60)  # 每分钟检查一次
+                await asyncio.sleep(60)  # 每分钟检查一次，但实际检查频率由BOT_HEALTH_CHECK_INTERVAL和退避机制决定
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -383,12 +424,23 @@ class BotManager:
 
     def get_available_bots(self) -> List[BotInstance]:
         """获取所有可用的机器人列表（包括可能恢复的）"""
-        available_bots = [
-            bot for bot in self.bots.values()
-            if bot.is_available()
-        ]
+        available_bots = []
 
-        # 按负载评分排序
+        # 🔍 增加详细诊断（新增）
+        for bot_id, bot in self.bots.items():
+            is_available = bot.is_available()
+            if not is_available:
+                self.logger.debug(f"机器人 {bot_id} 不可用: 状态={bot.status.value}, 启用={bot.config.enabled}")
+            if is_available:
+                available_bots.append(bot)
+
+        # 🚨 关键诊断：如果没有可用机器人，记录详细原因（新增）
+        if not available_bots:
+            self.logger.error(f"⚠️ 无可用机器人！总计{len(self.bots)}个机器人的详细状态:")
+            for bot_id, bot in self.bots.items():
+                self.logger.error(f"  - {bot_id}: 状态={bot.status.value}, 启用={bot.config.enabled}, 失败次数={bot.consecutive_failures}")
+
+        # 按负载评分排序（保持原逻辑）
         return sorted(available_bots, key=lambda b: b.get_load_score())
 
     def get_best_bot(self) -> Optional[BotInstance]:
@@ -407,6 +459,7 @@ class BotManager:
 
     async def mark_bot_rate_limited(self, bot_id: str, retry_after: int = 60):
         """标记机器人被限速"""
+        from .failover_manager import FailoverReason # 延迟导入
         if bot_id in self.bots:
             bot = self.bots[bot_id]
             bot.status = BotStatus.RATE_LIMITED
@@ -414,19 +467,38 @@ class BotManager:
             bot.last_error = f"Rate limited, retry after {retry_after}s"
             bot.consecutive_failures += 1
             await self._save_bot_status(bot)
-
             self.logger.warning(f"机器人 {bot_id} 被标记为限速状态")
 
-    async def mark_bot_error(self, bot_id: str, error_message: str):
-        """标记机器人错误"""
+            failover_manager = await self._get_failover_manager()
+            if failover_manager:
+                await failover_manager.handle_bot_failure(bot.bot_id, FailoverReason.RATE_LIMITED, bot.last_error)
+
+    async def mark_bot_error(self, bot_id: str, error_message: str, reason: str = 'api_error',
+                             _from_failover: bool = False):
+        """标记机器人错误 - 防循环版本"""
+        from .failover_manager import FailoverReason  # 延迟导入
         if bot_id in self.bots:
             bot = self.bots[bot_id]
             bot.status = BotStatus.ERROR
             bot.last_error = error_message[:100]
             bot.consecutive_failures += 1
             await self._save_bot_status(bot)
-
             self.logger.error(f"机器人 {bot_id} 被标记为错误状态: {error_message}")
+
+            # 🔥 关键修复：只有不是来自故障转移管理器的调用才触发故障转移
+            if not _from_failover:
+                failover_manager = await self._get_failover_manager()
+                if failover_manager:
+                    try:
+                        failover_reason_enum = FailoverReason(reason)
+                    except ValueError:
+                        self.logger.warning(f"未知故障原因字符串 '{reason}', 默认为 API_ERROR")
+                        failover_reason_enum = FailoverReason.API_ERROR
+
+                    await failover_manager.handle_bot_failure(
+                        bot.bot_id, failover_reason_enum, bot.last_error
+                    )
+
 
     async def record_bot_request(self, bot_id: str):
         """记录机器人请求"""
@@ -484,6 +556,7 @@ async def get_bot_manager() -> BotManager:
     if _bot_manager is None:
         # 延迟导入以避免循环依赖
         from .settings import settings
+        import redis.asyncio as redis # 确保这里导入
 
         # 尝试连接Redis
         redis_client = None
@@ -500,7 +573,9 @@ async def get_bot_manager() -> BotManager:
             logger.info("Redis库未安装，使用本地状态管理")
 
         _bot_manager = BotManager(redis_client)
-        await _bot_manager.start()
+        # 暂时不在这里调用 _bot_manager.start()，因为它的启动依赖于settings中的BOT_HEALTH_CHECK_INTERVAL，
+        # 并且启动逻辑应该由dependencies.py中的ApplicationLifecycleManager负责。
+        # _bot_manager.start() 将在 dependencies.py 中被调用。
 
     return _bot_manager
 
