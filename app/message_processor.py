@@ -10,6 +10,7 @@ from .validation import validate_webhook_update, validate_telegram_message, Vali
 from .monitoring import record_message_processing
 from .handlers import private, group
 from .settings import settings
+from .message_coordinator import CoordinationResult
 
 # from .tg_utils import tg_with_specific_bot # 这个导入现在不需要了，因为我们直接用 tg_utils.tg
 
@@ -221,14 +222,17 @@ class CoordinatedMessageHandler:
 
     async def handle_webhook_message(self, raw_update: Dict[str, Any]) -> str:
         try:
-            success = await self.message_coordinator.coordinate_message(raw_update)
+            result = await self.message_coordinator.coordinate_message(raw_update)
 
-            if success:
+            if result == CoordinationResult.QUEUED:
                 self.logger.debug("消息已成功提交到协调器")
                 return "queued"
-            else:
-                self.logger.error("消息协调失败")
-                return "coordination_failed"
+            if result == CoordinationResult.DUPLICATE:
+                self.logger.debug("检测到重复消息，已跳过")
+                return "duplicate"
+
+            self.logger.error("消息协调失败")
+            return "coordination_failed"
 
         except Exception as e:
             self.logger.error(f"消息协调异常: {e}", exc_info=True)

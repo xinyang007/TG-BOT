@@ -119,14 +119,28 @@ async def handle_group(msg: dict, conv_service: ConversationService, specific_bo
             copy_params["caption"] = current_caption + suffix
 
         # 4. 复制消息到实体聊天
+        # 如果目标是私聊用户，尽量使用该用户当前会话绑定的机器人
+        target_token = specific_bot_token
+        if conv.entity_type == 'user':
+            try:
+                from ..message_coordinator import get_message_coordinator
+                coordinator = await get_message_coordinator()
+                if coordinator:
+                    user_token = coordinator.load_balancer.get_user_bot_token(int(conv.entity_id))
+                    if user_token:
+                        target_token = user_token
+                        logger.debug(f"使用用户会话机器人发送消息，token后缀: {user_token[-5:]}")
+            except Exception as e:
+                logger.warning(f"获取用户 {conv.entity_id} 会话机器人token失败: {e}")
+
         try:
-            # copy_any 内部会调用 tg，因此需要传递 specific_bot_token
+            # copy_any 内部会调用 tg，因此需要传递 target_token
             await copy_any(
                 src_chat_id=settings.SUPPORT_GROUP_ID,
                 dst_chat_id=conv.entity_id,
                 message_id=message_id,
                 extra_params=copy_params,
-                specific_bot_token=specific_bot_token # 传递 specific_bot_token
+                specific_bot_token=target_token
             )
             logger.info(f"成功复制话题 {tid} 中的消息 {message_id} 到实体 {conv.entity_type} ID {conv.entity_id}")
         except Exception as e:

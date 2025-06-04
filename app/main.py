@@ -19,6 +19,7 @@ from app.store import create_all_tables
 from app.tg_utils import tg, close_http_client
 from app.handlers import private, group
 from app.logging_config import setup_logging, get_logger, get_message_logger
+from app.message_coordinator import CoordinationResult
 from app.validation import validate_webhook_update, validate_telegram_message, ValidationError
 from app.dependencies import (
     get_conversation_service, get_cache, get_metrics, get_health_checker,
@@ -246,10 +247,13 @@ async def enhanced_webhook_logic(
             try:
                 result = await coordinated_handler.handle_webhook_message(raw_update)
 
-                if result == "queued":
-                    msg_logger.info("✅ 消息已提交到协调队列")
+                if result in ("queued", "duplicate"):
+                    if result == "queued":
+                        msg_logger.info("✅ 消息已提交到协调队列")
+                    else:
+                        msg_logger.info("ℹ️ 重复消息已忽略")
                     record_message_processing(chat_type or "unknown", time.time() - start_time, True)
-                    return PlainTextResponse("queued")
+                    return PlainTextResponse(result)
                 else:
                     msg_logger.warning(f"⚠️ 协调处理结果: {result}，回退到直接处理")
                     # 回退到直接处理
@@ -1694,10 +1698,11 @@ async def stress_test_bots():
                 }
             }
 
-            success = await coordinator.coordinate_message(test_update)
+            coord_res = await coordinator.coordinate_message(test_update)
             results.append({
                 "message_number": i + 1,
-                "queued": success,
+                "queued": coord_res == CoordinationResult.QUEUED,
+                "duplicate": coord_res == CoordinationResult.DUPLICATE,
                 "timestamp": time.time()
             })
 

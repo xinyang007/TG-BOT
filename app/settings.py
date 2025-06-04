@@ -370,6 +370,13 @@ class Settings(BaseSettings):
         le=3600
     )
 
+    MESSAGE_DEDUP_TTL: int = Field(
+        default=120,
+        description="去重窗口，避免重复处理同一消息（秒）",
+        ge=30,
+        le=600
+    )
+
     MESSAGE_MAX_RETRIES: int = Field(
         default=3,
         description="消息处理最大重试次数",

@@ -539,6 +539,16 @@ class LoadBalancer:
             return True
         return False
 
+    def get_user_bot_token(self, user_id: int) -> Optional[str]:
+        """获取用户当前会话绑定的机器人token"""
+        session = self._private_sessions.get(user_id)
+        if not session:
+            return None
+        bot = self.bot_manager.get_bot_by_id(session['bot_id'])
+        if bot:
+            return bot.config.token
+        return None
+
     def get_assignment_stats(self) -> Dict[str, Any]:
         """获取分配统计（兼容性方法）"""
         session_info = self.get_session_info()
@@ -911,6 +921,17 @@ class MessageQueue:
             return {"error": str(e)}
 
 
+from enum import Enum
+
+
+class CoordinationResult(str, Enum):
+    """消息协调结果"""
+
+    QUEUED = "queued"
+    DUPLICATE = "duplicate"
+    FAILED = "failed"
+
+
 class MessageCoordinator:
     """消息分发协调器主类"""
 
@@ -970,27 +991,39 @@ class MessageCoordinator:
 
         self.logger.info("消息协调器已停止")
 
-    def generate_message_id(self, update_id: int, chat_id: int) -> str:
-        """生成唯一的消息ID"""
-        content = f"{update_id}:{chat_id}:{time.time()}"
+    def generate_message_id(self, chat_id: int, tg_message_id: int) -> str:
+        """生成唯一的消息ID (基于 chat_id + telegram message_id)"""
+        content = f"{chat_id}:{tg_message_id}"
         return hashlib.md5(content.encode()).hexdigest()[:16]
 
-    async def coordinate_message(self, raw_update: Dict[str, Any]) -> bool:
+    async def coordinate_message(self, raw_update: Dict[str, Any]) -> CoordinationResult:
         """协调处理单个消息"""
         update_id = raw_update.get("update_id")
         msg_data = raw_update.get("message", {}) or raw_update.get("edited_message", {}) or {}
         chat_id = msg_data.get("chat", {}).get("id")
+        tg_message_id = msg_data.get("message_id")
         user_id = msg_data.get("from", {}).get("id")
         chat_type = msg_data.get("chat", {}).get("type")
 
-        if not all([update_id, chat_id, chat_type]):
+        if not all([update_id, chat_id, chat_type, tg_message_id]):
             self.logger.warning("消息数据不完整，跳过处理")
-            return False
+            return CoordinationResult.FAILED
 
-        # 生成消息ID
-        message_id = self.generate_message_id(update_id, chat_id)
+        # 生成消息ID，确保跨机器人唯一
+        message_id = self.generate_message_id(chat_id, tg_message_id)
 
-        # 确保不会重复处理
+        # 去重检查：若在TTL窗口内已处理则跳过
+        processed_key = f"msg_processed:{message_id}"
+        if self.redis_client:
+            try:
+                exists = await self.redis_client.exists(processed_key)
+                if exists:
+                    self.logger.debug(f"检测到重复消息 {message_id}，跳过处理")
+                    return CoordinationResult.DUPLICATE
+            except Exception as e:
+                self.logger.warning(f"检查消息去重状态失败: {e}")
+
+        # 确保不会重复处理（并发锁）
         lock_key = f"msg_coord_lock:{message_id}"
         # 设置一个较短的锁超时，例如10秒，足够消息入队
         try:
@@ -1022,13 +1055,29 @@ class MessageCoordinator:
                 success = await self.message_queue.enqueue(queued_msg)
                 if success:
                     self.logger.info(f"消息 {message_id} 已协调分配给机器人 {selected_bot_id} 并成功入队。")
+                    if self.redis_client:
+                        try:
+                            await self.redis_client.set(
+                                processed_key,
+                                1,
+                                ex=settings.MESSAGE_DEDUP_TTL,
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"记录消息去重键失败: {e}")
+                    return CoordinationResult.QUEUED
                 else:
                     self.logger.error(f"消息 {message_id} 协调成功但入队失败。")
-
-                return success
+                    return CoordinationResult.FAILED
         except Exception as e:
             self.logger.error(f"协调消息 {message_id} 时获取锁或处理异常: {e}", exc_info=True)
-            return False
+            if self.redis_client:
+                try:
+                    exists = await self.redis_client.exists(processed_key)
+                    if exists:
+                        return CoordinationResult.DUPLICATE
+                except Exception:
+                    pass
+            return CoordinationResult.FAILED
 
     def _determine_priority(self, user_id: Optional[int], chat_type: str, msg_data: Dict) -> MessagePriority:
         """确定消息优先级"""
