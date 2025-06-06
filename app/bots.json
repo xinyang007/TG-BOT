@@ -1,0 +1,22 @@
+[
+  {
+    "token": "7466421659:AAGtGGk0xB-4DdOkAJgFhd4PCdc3qk1ULKs",
+    "name": "主机器人",
+    "priority": 1,
+    "enabled": true,
+    "max_requests_per_minute": 20,
+    "webhook_strategy": "auto_detect",
+    "webhook_identifier": "main",
+    "webhook_path": "webhook"
+  },
+  {
+    "token": "7775822776:AAHjFptiTffOw2AveeWHS2M76lT42kAND_o",
+    "name": "备用机器人1",
+    "priority": 2,
+    "enabled": true,
+    "max_requests_per_minute": 20,
+    "webhook_strategy": "shared_path",
+    "webhook_identifier": "backup1",
+    "webhook_path": "webhook"
+  }
+]

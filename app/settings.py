@@ -1,20 +1,49 @@
+# app/settings.py - 详细修改版本
+
 from functools import lru_cache
 from pathlib import Path
 from pydantic import Field, HttpUrl, validator, BaseModel
 from pydantic_settings import BaseSettings
 import secrets
 from enum import Enum
-from typing import List, Union, Dict, Any
+from typing import List, Union, Dict, Any, Optional
 import json
 
 
+
+# 🔥 新增：Webhook策略枚举
+class BotWebhookStrategy(str, Enum):
+    """Webhook策略"""
+    DEDICATED_DOMAIN = "dedicated_domain"  # 专用域名
+    SHARED_PATH = "shared_path"  # 共享IP不同路径
+    AUTO_DETECT = "auto_detect"  # 自动检测（推荐）
+
+
 class BotConfig(BaseModel):
-    """单个机器人配置"""
+    """单个机器人配置（增强版本）"""
     token: str = Field(..., description="机器人Token")
     name: str = Field(..., description="机器人名称")
     priority: int = Field(default=1, description="优先级，数字越小优先级越高")
     enabled: bool = Field(default=True, description="是否启用")
     max_requests_per_minute: int = Field(default=20, description="每分钟最大请求数")
+
+    # 🔥 新增：Webhook配置
+    webhook_strategy: BotWebhookStrategy = Field(
+        default=BotWebhookStrategy.AUTO_DETECT,
+        description="Webhook策略"
+    )
+    webhook_domain: Optional[str] = Field(
+        default=None,
+        description="专用域名（如 main.bot-domain.com）"
+    )
+    webhook_identifier: Optional[str] = Field(
+        default=None,
+        description="Webhook标识符（用于路径区分）"
+    )
+    webhook_path: str = Field(
+        default="webhook",
+        description="Webhook路径"
+    )
 
     @validator('token')
     @classmethod
@@ -47,6 +76,13 @@ class BotConfig(BaseModel):
         if v < 1 or v > 100:
             raise ValueError('每分钟最大请求数必须在1-100之间')
         return v
+
+    def get_webhook_identifier(self) -> str:
+        """获取webhook标识符"""
+        if self.webhook_identifier:
+            return self.webhook_identifier
+        # 默认使用 bot_前缀 + token的前6位
+        return f"bot_{self.token.split(':')[0]}"
 
 
 class LogLevel(str, Enum):
@@ -96,6 +132,11 @@ class Settings(BaseSettings):
         description="是否启用多机器人模式"
     )
 
+    BOT_CONFIGS_FILE: Optional[str] = Field(
+        default=None,
+        description="机器人配置文件路径（JSON格式）"
+    )
+
     BOT_CONFIGS: Union[List[BotConfig], str] = Field(
         default=[],
         description="机器人配置列表"
@@ -105,7 +146,7 @@ class Settings(BaseSettings):
     BOT_TOKEN: str = Field(
         default="",
         description="主要机器人Token（向后兼容）",
-        min_length=0  # 允许为空，因为可能使用多机器人配置
+        min_length=0
     )
 
     # 客服支持话题所在的超级群组 ID
@@ -113,6 +154,38 @@ class Settings(BaseSettings):
         ...,
         alias="GROUP_ID",
         description="Telegram Support Supergroup ID for customer support topics"
+    )
+
+    # --- 🔥 新增：Webhook路由配置 ---
+
+    # 主机器人专用域名（可选）
+    PRIMARY_BOT_DOMAIN: Optional[str] = Field(
+        default=None,
+        description="主机器人专用域名（如 main.bot-domain.com）"
+    )
+
+    # 备用机器人是否使用共享域名
+    BACKUP_BOTS_USE_SHARED_DOMAIN: bool = Field(
+        default=True,
+        description="备用机器人是否使用共享域名"
+    )
+
+    # 启用智能webhook路由
+    ENABLE_SMART_WEBHOOK_ROUTING: bool = Field(
+        default=True,
+        description="启用智能webhook路由"
+    )
+
+    # Webhook路径前缀
+    WEBHOOK_PATH_PREFIX: str = Field(
+        default="webhook",
+        description="Webhook路径前缀"
+    )
+
+    # 启用webhook来源检测
+    ENABLE_WEBHOOK_SOURCE_DETECTION: bool = Field(
+        default=True,
+        description="启用webhook来源检测"
     )
 
     # --- 数据库设置 ---
@@ -265,7 +338,6 @@ class Settings(BaseSettings):
         description="通知语言 (zh=中文, en=英文)"
     )
 
-    # 群聊限制时是否同时私信用户详细信息
     ALSO_NOTIFY_USER_PRIVATELY: bool = Field(
         default=False,
         description="群聊触发限制时是否同时私信用户详细信息（除了在群里通知）"
@@ -277,6 +349,7 @@ class Settings(BaseSettings):
         ge=10,
         le=300
     )
+
     # --- 消息协调配置 ---
     ENABLE_MESSAGE_COORDINATION: bool = Field(
         default=True,
@@ -295,6 +368,13 @@ class Settings(BaseSettings):
         description="消息处理超时时间（秒）",
         ge=30,
         le=3600
+    )
+
+    MESSAGE_DEDUP_TTL: int = Field(
+        default=120,
+        description="去重窗口，避免重复处理同一消息（秒）",
+        ge=30,
+        le=600
     )
 
     MESSAGE_MAX_RETRIES: int = Field(
@@ -320,13 +400,13 @@ class Settings(BaseSettings):
 
     # --- 负载均衡配置 ---
     LOAD_BALANCER_ALGORITHM: str = Field(
-        default="health_priority",
-        description="负载均衡算法 (health_priority, weighted_round_robin, least_connections, priority_based)"
+        default="balanced",
+        description="负载均衡算法 (balanced, health_priority, load_based)"
     )
 
     BOT_SELECTION_STRATEGY: str = Field(
-        default="health_priority",
-        description="机器人选择策略 (health_priority, load_based, random)"
+        default="balanced",
+        description="机器人选择策略 (balanced, health_priority, load_based)"
     )
 
     # --- 消息优先级配置 ---
@@ -381,6 +461,44 @@ class Settings(BaseSettings):
         description="启用自动故障转移"
     )
 
+    # --- 熔断器配置 ---
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = Field(
+        default=5,
+        description="熔断器故障阈值（连续失败次数）",
+        ge=1,
+        le=10
+    )
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT: int = Field(
+        default=60,
+        description="熔断器恢复超时时间（秒，进入半开状态前）",
+        ge=10,
+        le=300
+    )
+    CIRCUIT_BREAKER_SUCCESS_THRESHOLD: int = Field(
+        default=3,
+        description="熔断器半开状态下恢复成功阈值",
+        ge=1,
+        le=10
+    )
+    CIRCUIT_BREAKER_REQUEST_TIMEOUT: float = Field(
+        default=30.0,
+        description="熔断器内部调用超时时间（秒）",
+        ge=5.0,
+        le=120.0
+    )
+    CIRCUIT_BREAKER_MAX_FAILURES_IN_WINDOW: int = Field(
+        default=10,
+        description="熔断器时间窗口内最大失败次数",
+        ge=5,
+        le=50
+    )
+    CIRCUIT_BREAKER_TIME_WINDOW: int = Field(
+        default=300,
+        description="熔断器时间窗口（秒）",
+        ge=60,
+        le=3600
+    )
+
     # --- 监控和告警配置 ---
     COORDINATION_MONITORING_ENABLED: bool = Field(
         default=True,
@@ -401,12 +519,97 @@ class Settings(BaseSettings):
         le=600
     )
 
+    # --- 🔥 新增方法：Webhook相关 ---
+
+    def get_bot_webhook_url(self, bot_config: BotConfig) -> str:
+        """获取机器人的webhook URL（修复版本）"""
+        # 规范化 PUBLIC_BASE_URL
+        base_url = str(self.PUBLIC_BASE_URL).rstrip('/')
+
+        # 确保base_url以https://开头
+        if not base_url.startswith('https://'):
+            if base_url.startswith('http://'):
+                base_url = base_url.replace('http://', 'https://', 1)
+            elif '://' not in base_url:
+                base_url = f"https://{base_url}"
+
+        # 🔥 修复：根据机器人模式选择不同的URL策略
+        if not self.MULTI_BOT_ENABLED:
+            # 单机器人模式：使用设置的WEBHOOK_PATH
+            return f"{base_url}/{self.WEBHOOK_PATH}"
+
+        # 多机器人模式的URL生成策略
+        if bot_config.priority == 1:
+            # 🔥 主机器人使用简单路径 "webhook"，而不是随机字符串
+            return f"{base_url}/webhook"
+        else:
+            # 🔥 备用机器人使用 WEBHOOK_PATH + 标识符的组合
+            identifier = bot_config.get_webhook_identifier()
+            return f"{base_url}/{self.WEBHOOK_PATH}/{identifier}"
+
+    def get_webhook_paths_for_routes(self) -> Dict[str, str]:
+        """获取用于FastAPI路由的webhook路径配置"""
+        paths = {}
+
+        if not self.MULTI_BOT_ENABLED:
+            # 单机器人模式
+            paths['single'] = self.WEBHOOK_PATH
+            return paths
+
+        # 多机器人模式
+        enabled_bots = self.get_enabled_bots()
+        for bot_config in enabled_bots:
+            if bot_config.priority == 1:
+                # 主机器人使用简单路径
+                paths['primary'] = "webhook"
+            else:
+                # 备用机器人使用复合路径
+                identifier = bot_config.get_webhook_identifier()
+                paths[f'bot_{bot_config.priority}'] = f"{self.WEBHOOK_PATH}/{identifier}"
+
+        return paths
+
+    def get_primary_bot_config(self) -> Optional[BotConfig]:
+        """获取主机器人配置"""
+        enabled_bots = self.get_enabled_bots()
+        if enabled_bots:
+            return min(enabled_bots, key=lambda b: b.priority)
+        return None
+
+    def get_bot_by_token_prefix(self, token_prefix: str) -> Optional[BotConfig]:
+        """通过token前缀查找机器人"""
+        enabled_bots = self.get_enabled_bots()
+        for bot in enabled_bots:
+            if bot.token.startswith(f"{token_prefix}:"):
+                return bot
+        return None
+
+    def get_bot_by_identifier(self, identifier: str) -> Optional[BotConfig]:
+        """通过标识符查找机器人"""
+        enabled_bots = self.get_enabled_bots()
+        for bot in enabled_bots:
+            if (identifier == bot.get_webhook_identifier() or
+                    identifier == bot.webhook_identifier or
+                    identifier == bot.name.replace(' ', '_').lower()):
+                return bot
+        return None
+
+    def get_circuit_breaker_config(self) -> Dict[str, Any]:
+        """获取熔断器配置（修复版本）"""
+        return {
+            "failure_threshold": getattr(self, 'CIRCUIT_BREAKER_FAILURE_THRESHOLD', 5),
+            "recovery_timeout": getattr(self, 'CIRCUIT_BREAKER_RECOVERY_TIMEOUT', 60),
+            "success_threshold": getattr(self, 'CIRCUIT_BREAKER_SUCCESS_THRESHOLD', 3),
+            "max_failures_in_window": getattr(self, 'CIRCUIT_BREAKER_MAX_FAILURES_IN_WINDOW', 10),
+            "time_window": getattr(self, 'CIRCUIT_BREAKER_TIME_WINDOW', 300)
+        }
+
     # --- 验证器 ---
     @validator('LOAD_BALANCER_ALGORITHM')
     @classmethod
     def validate_load_balancer_algorithm(cls, v):
         """验证负载均衡算法"""
-        valid_algorithms = ["health_priority", "weighted_round_robin", "least_connections", "priority_based"]
+        valid_algorithms = ["balanced", "health_priority", "load_based"]
         if v not in valid_algorithms:
             raise ValueError(f"负载均衡算法必须是以下之一: {valid_algorithms}")
         return v
@@ -415,7 +618,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_bot_selection_strategy(cls, v):
         """验证机器人选择策略"""
-        valid_strategies = ["health_priority", "load_based", "random"]
+        valid_strategies = ["balanced", "health_priority", "load_based"]
         if v not in valid_strategies:
             raise ValueError(f"机器人选择策略必须是以下之一: {valid_strategies}")
         return v
@@ -429,76 +632,62 @@ class Settings(BaseSettings):
             warnings.warn("启用消息协调但未启用多机器人模式，协调功能将不会工作")
         return v
 
-    def get_coordination_config(self) -> Dict[str, Any]:
-        """获取协调器配置"""
-        return {
-            "enabled": self.ENABLE_MESSAGE_COORDINATION,
-            "queue_max_size": self.MESSAGE_QUEUE_MAX_SIZE,
-            "processing_timeout": self.MESSAGE_PROCESSING_TIMEOUT,
-            "max_retries": self.MESSAGE_MAX_RETRIES,
-            "lock_timeout": self.COORDINATION_LOCK_TIMEOUT,
-            "cleanup_interval": self.COORDINATION_CLEANUP_INTERVAL,
-            "load_balancer_algorithm": self.LOAD_BALANCER_ALGORITHM,
-            "bot_selection_strategy": self.BOT_SELECTION_STRATEGY
-        }
-
-    def get_priority_config(self) -> Dict[str, Any]:
-        """获取优先级配置"""
-        return {
-            "admin_boost": self.ADMIN_MESSAGE_PRIORITY_BOOST,
-            "support_group_boost": self.SUPPORT_GROUP_PRIORITY_BOOST,
-            "private_chat_priority": self.PRIVATE_CHAT_PRIORITY,
-            "group_chat_priority": self.GROUP_CHAT_PRIORITY
-        }
-
-    def get_monitoring_config(self) -> Dict[str, Any]:
-        """获取监控配置"""
-        return {
-            "enabled": self.COORDINATION_MONITORING_ENABLED,
-            "queue_alert_threshold": self.QUEUE_SIZE_ALERT_THRESHOLD,
-            "delay_alert_threshold": self.PROCESSING_DELAY_ALERT_THRESHOLD,
-            "health_check_interval": self.BOT_HEALTH_CHECK_INTERVAL,
-            "failure_threshold": self.BOT_FAILURE_THRESHOLD,
-            "recovery_check_interval": self.BOT_RECOVERY_CHECK_INTERVAL
-        }
-
-    def validate_coordination_configuration(self) -> List[str]:
-        """验证协调配置并返回警告信息"""
-        warnings = []
-
-        # 检查协调器配置
-        if self.MULTI_BOT_ENABLED and self.ENABLE_MESSAGE_COORDINATION:
-            # 检查Redis配置
-            if not self.REDIS_URL or self.REDIS_URL == "redis://localhost:6379":
-                warnings.append("使用默认Redis配置，生产环境请配置专用Redis实例")
-
-            # 检查队列大小
-            if self.MESSAGE_QUEUE_MAX_SIZE < 1000:
-                warnings.append("消息队列大小较小，可能影响高并发处理")
-
-            # 检查超时配置
-            if self.MESSAGE_PROCESSING_TIMEOUT < 60:
-                warnings.append("消息处理超时时间较短，可能导致正常消息被标记为超时")
-
-            # 检查机器人配置
-            enabled_bots = self.get_enabled_bots()
-            if len(enabled_bots) < 2:
-                warnings.append("启用了消息协调但机器人数量少于2个，建议配置多个机器人")
-
-            # 检查优先级配置
-            if self.PRIVATE_CHAT_PRIORITY == self.GROUP_CHAT_PRIORITY:
-                warnings.append("私聊和群聊消息优先级相同，建议区分优先级")
-
-        elif self.ENABLE_MESSAGE_COORDINATION and not self.MULTI_BOT_ENABLED:
-            warnings.append("启用了消息协调但未启用多机器人模式")
-
-        return warnings
-
-    # --- 验证器 ---
     @validator('BOT_CONFIGS', pre=True)
     @classmethod
     def parse_bot_configs(cls, v, values):
         """解析机器人配置"""
+        import os
+        import json
+        from pathlib import Path
+
+        # 🔥 新增：优先检查外部配置文件
+        bot_configs_file = values.get('BOT_CONFIGS_FILE')
+        if bot_configs_file:
+            config_path = Path(bot_configs_file)
+
+            # 如果路径不是绝对路径，相对于项目根目录
+            if not config_path.is_absolute():
+                # 获取项目根目录（settings.py的上级目录）
+                current_file = Path(__file__).resolve()
+                project_root = current_file.parent.parent
+                config_path = project_root / config_path
+
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        file_content = json.load(f)
+
+                    # 验证文件内容格式
+                    if isinstance(file_content, list):
+                        bot_configs = []
+                        for i, config in enumerate(file_content):
+                            if isinstance(config, dict):
+                                try:
+                                    bot_config = BotConfig(**config)
+                                    bot_configs.append(bot_config)
+                                except Exception as e:
+                                    raise ValueError(f"外部文件中机器人配置 {i + 1} 无效: {e}")
+                            else:
+                                raise ValueError(f"外部文件中机器人配置 {i + 1} 必须是字典格式")
+
+                        # 验证至少有一个启用的机器人
+                        enabled_bots = [bot for bot in bot_configs if bot.enabled]
+                        if not enabled_bots:
+                            import warnings
+                            warnings.warn("外部配置文件中没有启用的机器人")
+
+                        return bot_configs
+                    else:
+                        raise ValueError("外部配置文件必须包含机器人配置数组")
+
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"外部配置文件JSON格式错误: {e}")
+                except Exception as e:
+                    raise ValueError(f"读取外部配置文件失败: {e}")
+            else:
+                raise ValueError(f"指定的配置文件不存在: {config_path}")
+
+        # 如果没有指定外部文件，使用原有逻辑
         # 如果是字符串，尝试解析为JSON
         if isinstance(v, str):
             if not v.strip():
@@ -642,7 +831,7 @@ class Settings(BaseSettings):
         "populate_by_name": True,
         "use_enum_values": True,
         "env_prefix": "",
-        "extra": "ignore",  # 忽略额外字段
+        "extra": "ignore",
     }
 
     def get_enabled_bots(self) -> List[BotConfig]:
@@ -700,6 +889,25 @@ class Settings(BaseSettings):
             elif len(enabled_bots) == 1:
                 warnings.append("多机器人模式只配置了一个机器人，建议配置多个以提供冗余")
 
+            # 🔥 新增：检查外部配置文件
+            if self.BOT_CONFIGS_FILE:
+                from pathlib import Path
+                config_path = Path(self.BOT_CONFIGS_FILE)
+                if not config_path.is_absolute():
+                    current_file = Path(__file__).resolve()
+                    project_root = current_file.parent.parent
+                    config_path = project_root / config_path
+
+                if not config_path.exists():
+                    warnings.append(f"指定的机器人配置文件不存在: {config_path}")
+                else:
+                    try:
+                        import json
+                        with open(config_path, 'r', encoding='utf-8') as f:
+                            json.load(f)
+                    except Exception as e:
+                        warnings.append(f"机器人配置文件格式错误: {e}")
+
             # 检查Token重复
             tokens = [bot.token for bot in enabled_bots]
             if len(tokens) != len(set(tokens)):
@@ -728,11 +936,12 @@ def get_settings() -> Settings:
 # 在模块加载时即加载设置
 settings = get_settings()
 
-# 更新验证函数
+
+# 验证函数
 def validate_settings_on_import():
-    """导入时验证设置（更新版本）"""
+    """导入时验证设置"""
     try:
-        # 原有的检查
+        # 基础验证
         if settings.MULTI_BOT_ENABLED:
             enabled_bots = settings.get_enabled_bots()
             if not enabled_bots:
@@ -747,37 +956,28 @@ def validate_settings_on_import():
         if not settings.PUBLIC_BASE_URL:
             raise ValueError("PUBLIC_BASE_URL 未设置")
 
-        # 验证配置并显示警告
-        general_warnings = settings.validate_configuration()
-        coordination_warnings = settings.validate_coordination_configuration()
-
-        all_warnings = general_warnings + coordination_warnings
-
-        if all_warnings:
-            import sys
-            for warning in all_warnings:
-                print(f"配置警告: {warning}", file=sys.stderr)
-
         # 显示配置摘要
         if settings.MULTI_BOT_ENABLED:
             enabled_count = len(settings.get_enabled_bots())
             print(f"✅ 多机器人模式启用，配置了 {enabled_count} 个机器人")
 
-            if settings.ENABLE_MESSAGE_COORDINATION:
-                print(f"✅ 消息协调器已启用")
-                coord_config = settings.get_coordination_config()
-                print(f"   - 负载均衡算法: {coord_config['load_balancer_algorithm']}")
-                print(f"   - 机器人选择策略: {coord_config['bot_selection_strategy']}")
-                print(f"   - 队列最大大小: {coord_config['queue_max_size']}")
-            else:
-                print("⚠️ 消息协调器已禁用")
-        else:
-            print("✅ 单机器人模式")
+            # 显示Webhook配置
+            if settings.ENABLE_SMART_WEBHOOK_ROUTING:
+                print(f"✅ 智能Webhook路由已启用")
+                for bot in settings.get_enabled_bots():
+                    webhook_url = settings.get_bot_webhook_url(bot)
+                    print(f"   - {bot.name}: {webhook_url}")
+
+        # 验证配置并显示警告
+        warnings = settings.validate_configuration()
+        if warnings:
+            import sys
+            for warning in warnings:
+                print(f"配置警告: {warning}", file=sys.stderr)
 
     except Exception as e:
         import sys
         print(f"配置验证失败: {e}", file=sys.stderr)
-        # 在开发环境可以选择不退出，生产环境应该退出
         if settings.is_production():
             sys.exit(1)
 

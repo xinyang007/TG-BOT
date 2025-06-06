@@ -82,7 +82,7 @@ class AdvancedRateLimiter:
         self.add_rule(RateLimitRule(
             name="user_message_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,  # 使用滑动窗口更精确
-            max_requests=5,
+            max_requests=10,
             window_seconds=30,
             action_types=[ActionType.MESSAGE],
             user_groups=["normal"],
@@ -94,7 +94,7 @@ class AdvancedRateLimiter:
         self.add_rule(RateLimitRule(
             name="premium_message_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,
-            max_requests=5,
+            max_requests=10,
             window_seconds=30,
             action_types=[ActionType.MESSAGE],
             user_groups=["premium"],
@@ -106,7 +106,7 @@ class AdvancedRateLimiter:
         self.add_rule(RateLimitRule(
             name="admin_message_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,
-            max_requests=5,
+            max_requests=10,
             window_seconds=30,
             action_types=[ActionType.MESSAGE],
             user_groups=["admin"],
@@ -118,7 +118,7 @@ class AdvancedRateLimiter:
         self.add_rule(RateLimitRule(
             name="api_calls_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,
-            max_requests=5,
+            max_requests=10,
             window_seconds=30,
             action_types=[ActionType.API_CALL],
             burst_allowance=1,  # API调用突发允许1次
@@ -129,7 +129,7 @@ class AdvancedRateLimiter:
         self.add_rule(RateLimitRule(
             name="bind_attempts_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,
-            max_requests=5,
+            max_requests=10,
             window_seconds=30,
             action_types=[ActionType.BIND],
             burst_allowance=1,  # 绑定操作突发允许1次
