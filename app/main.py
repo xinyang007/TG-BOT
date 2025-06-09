@@ -499,50 +499,55 @@ async def webhook(
         user_name = validated_message.get_user_name()
 
         # 增强的速率限制检查（带通知功能）
-        if user_id:
-            try:
-                from app.rate_limit import get_rate_limiter, ActionType
+        if user_id:  # 确保有用户ID，例如频道消息可能没有
+            # 如果消息来自客服支持群组，则跳过用户速率限制检查
+            if str(chat_id) == settings.SUPPORT_GROUP_ID:
+                logger.info(f"ℹ️ 消息来自客服支持群组 {chat_id}，跳过管理员 {user_id} 的用户速率限制检查。")
+                # 继续处理消息，不进行速率限制。
+                pass
+            else:  # 对其他聊天应用速率限制
+                try:
+                    from app.rate_limit import get_rate_limiter, ActionType
 
-                # 获取详细的速率限制信息
-                logger.info(f"🔍 检查速率限制: user_id={user_id}, chat_type={chat_type}")
+                    # 获取详细的速率限制信息
+                    logger.info(f"🔍 检查速率限制: user_id={user_id}, chat_type={chat_type}")
 
-                # 直接调用速率限制器获取详细结果
-                limiter = await get_rate_limiter()
-                user_group = settings.get_user_group(user_id)
-                rate_result = await limiter.check_rate_limit(
-                    f"user:{user_id}", ActionType.MESSAGE, user_group
-                )
-
-                if not rate_result.allowed:
-                    logger.warning(
-                        f"🚫 速率限制触发: 用户{user_id}, 聊天类型{chat_type}, "
-                        f"当前{rate_result.current_count}/{rate_result.limit}, "
-                        f"剩余时间{int(rate_result.reset_time - time.time())}秒"
+                    # 直接调用速率限制器获取详细结果
+                    limiter = await get_rate_limiter()
+                    user_group = settings.get_user_group(user_id)
+                    rate_result = await limiter.check_rate_limit(
+                        f"user:{user_id}", ActionType.MESSAGE, user_group
                     )
-                    metrics.counter("rate_limit_hits").increment()
+                    if not rate_result.allowed:
+                        logger.warning(
+                            f"🚫 速率限制触发: 用户{user_id}, 聊天类型{chat_type}, "
+                            f"当前{rate_result.current_count}/{rate_result.limit}, "
+                            f"剩余时间{int(rate_result.reset_time - time.time())}秒"
+                        )
+                        metrics.counter("rate_limit_hits").increment()
 
-                    # 发送通知给用户
-                    await send_rate_limit_notification(
-                        user_id=user_id,
-                        user_name=user_name,
-                        chat_type=chat_type,
-                        chat_id=chat_id,
-                        rate_result=rate_result,
-                        msg_id=msg_id
-                    )
+                        # 发送通知给用户
+                        await send_rate_limit_notification(
+                            user_id=user_id,
+                            user_name=user_name,
+                            chat_type=chat_type,
+                            chat_id=chat_id,
+                            rate_result=rate_result,
+                            msg_id=msg_id,
+                        )
 
-                    # 如果有惩罚时间，也发送惩罚通知
-                    if hasattr(rate_result, 'punishment_ends_at') and rate_result.punishment_ends_at:
-                        punishment_duration = int(rate_result.punishment_ends_at - time.time())
-                        if punishment_duration > 0:
-                            await send_punishment_notification(user_id, punishment_duration)
+                        # 如果有惩罚时间，也发送惩罚通知
+                        if hasattr(rate_result, 'punishment_ends_at') and rate_result.punishment_ends_at:
+                            punishment_duration = int(rate_result.punishment_ends_at - time.time())
+                            if punishment_duration > 0:
+                                await send_punishment_notification(user_id, punishment_duration)
 
-                    return PlainTextResponse("rate_limited")
-                else:
-                    logger.debug(f"✅ 速率限制检查通过: user_id={user_id}")
+                        return PlainTextResponse("rate_limited")
+                    else:
+                        logger.debug(f"✅ 速率限制检查通过: user_id={user_id}")
 
-            except Exception as e:
-                logger.error(f"❌ 速率限制检查失败: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"❌ 速率限制检查失败: {e}", exc_info=True)
 
         # 使用消息相关的日志器
         msg_logger = get_message_logger(

@@ -113,6 +113,57 @@ class RateLimitNotificationManager:
         for key in expired_keys:
             del _notification_cooldowns[key]
 
+    async def _send_safe_message(self, chat_id: int, text: str, parse_mode: str = "HTML",
+                                 reply_to_message_id: int = None) -> bool:
+        """安全发送消息，处理回复失败的情况"""
+        # 构建基本payload
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode
+        }
+
+        # 如果有回复消息ID，添加回复参数和容错参数
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True  # 关键：如果回复失败则正常发送
+
+        try:
+            await tg("sendMessage", payload)
+            self.logger.debug(f"✅ 消息发送成功到聊天 {chat_id}")
+            return True
+
+        except Exception as e:
+            error_msg = str(e).lower()
+
+            # 检查是否是回复相关错误
+            if any(keyword in error_msg for keyword in [
+                "message to be replied not found",
+                "message not found",
+                "reply message not found",
+                "replied message not found"
+            ]):
+                self.logger.warning(
+                    f"⚠️ 回复的消息不存在 (chat_id: {chat_id}, reply_to: {reply_to_message_id})，尝试直接发送")
+
+                # 移除回复参数，直接发送
+                fallback_payload = {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": parse_mode
+                }
+
+                try:
+                    await tg("sendMessage", fallback_payload)
+                    self.logger.info(f"✅ 回退发送成功到聊天 {chat_id}")
+                    return True
+                except Exception as fallback_error:
+                    self.logger.error(f"❌ 回退发送也失败: {fallback_error}")
+                    return False
+            else:
+                self.logger.error(f"❌ 发送消息失败 (chat_id: {chat_id}): {e}")
+                return False
+
     async def send_notification(self, user_id: int, user_name: str, chat_type: str,
                                 chat_id: int, rate_result, msg_id: int = None):
         """发送速率限制通知"""
@@ -145,13 +196,15 @@ class RateLimitNotificationManager:
                     f"{template.suggestion}"
                 )
 
-                await tg("sendMessage", {
-                    "chat_id": user_id,  # 发送到私聊
-                    "text": notification_text,
-                    "parse_mode": "HTML"
-                })
+                success = await self._send_safe_message(
+                    chat_id=user_id,
+                    text=notification_text
+                )
 
-                self.logger.info(f"✅ 已向用户 {user_id} 发送私聊限速通知")
+                if success:
+                    self.logger.info(f"✅ 已向用户 {user_id} 发送私聊限速通知")
+                else:
+                    self.logger.error(f"❌ 向用户 {user_id} 发送私聊限速通知失败")
 
             elif chat_type in ("group", "supergroup"):
                 # 群聊 - 在群聊中通知
@@ -164,14 +217,17 @@ class RateLimitNotificationManager:
                     f"📈 状态：{rate_result.current_count}/{rate_result.limit} 条消息"
                 )
 
-                await tg("sendMessage", {
-                    "chat_id": chat_id,  # 发送到群聊
-                    "text": notification_text,
-                    "parse_mode": "HTML",
-                    "reply_to_message_id": msg_id  # 回复触发限制的消息
-                })
+                # 安全发送群聊通知（可能回复原消息）
+                success = await self._send_safe_message(
+                    chat_id=chat_id,
+                    text=notification_text,
+                    reply_to_message_id=msg_id if msg_id else None
+                )
 
-                self.logger.info(f"✅ 已在群聊 {chat_id} 发送用户 {user_id} 的限速通知")
+                if success:
+                    self.logger.info(f"✅ 已在群聊 {chat_id} 发送用户 {user_id} 的限速通知")
+                else:
+                    self.logger.error(f"❌ 在群聊 {chat_id} 发送用户 {user_id} 的限速通知失败")
 
                 # 可选：同时私信用户详细信息
                 if getattr(settings, 'ALSO_NOTIFY_USER_PRIVATELY', False):
@@ -184,15 +240,15 @@ class RateLimitNotificationManager:
                         f"{private_template.suggestion}"
                     )
 
-                    try:
-                        await tg("sendMessage", {
-                            "chat_id": user_id,
-                            "text": private_text,
-                            "parse_mode": "HTML"
-                        })
+                    private_success = await self._send_safe_message(
+                        chat_id=user_id,
+                        text=private_text
+                    )
+
+                    if private_success:
                         self.logger.info(f"✅ 已向用户 {user_id} 发送群聊限速私信通知")
-                    except Exception as e:
-                        self.logger.warning(f"⚠️ 发送私信通知失败: {e}")
+                    else:
+                        self.logger.warning(f"⚠️ 向用户 {user_id} 发送群聊限速私信通知失败")
 
         except Exception as e:
             self.logger.error(f"❌ 发送限速通知失败: {e}", exc_info=True)
@@ -225,13 +281,15 @@ class RateLimitNotificationManager:
                     f"⌛ Please wait for automatic removal"
                 )
 
-            await tg("sendMessage", {
-                "chat_id": user_id,
-                "text": text,
-                "parse_mode": "HTML"
-            })
+            success = await self._send_safe_message(
+                chat_id=user_id,
+                text=text
+            )
 
-            self.logger.info(f"✅ 已向用户 {user_id} 发送惩罚期通知，时长：{time_str}")
+            if success:
+                self.logger.info(f"✅ 已向用户 {user_id} 发送惩罚期通知，时长：{time_str}")
+            else:
+                self.logger.error(f"❌ 向用户 {user_id} 发送惩罚期通知失败，时长：{time_str}")
 
         except Exception as e:
             self.logger.error(f"❌ 发送惩罚期通知失败: {e}", exc_info=True)
