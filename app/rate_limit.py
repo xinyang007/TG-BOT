@@ -77,12 +77,12 @@ class AdvancedRateLimiter:
         self._setup_default_rules()
 
     def _setup_default_rules(self):
-        """设置默认速率限制规则 - 30秒内5次"""
-        # 普通用户消息限制 - 30秒5次
+        """设置默认速率限制规则 - 30秒内10次"""
+        # 普通用户消息限制 - 30秒10次
         self.add_rule(RateLimitRule(
             name="user_message_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,  # 使用滑动窗口更精确
-            max_requests=5,
+            max_requests=10,
             window_seconds=30,
             action_types=[ActionType.MESSAGE],
             user_groups=["normal"],
@@ -90,24 +90,24 @@ class AdvancedRateLimiter:
             punishment_duration=60  # 1分钟惩罚
         ))
 
-        # 高级用户限制 - 30秒5次（与普通用户相同）
+        # 高级用户限制 - 60秒20次
         self.add_rule(RateLimitRule(
             name="premium_message_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,
-            max_requests=5,
-            window_seconds=30,
+            max_requests=20,
+            window_seconds=60,
             action_types=[ActionType.MESSAGE],
             user_groups=["premium"],
             burst_allowance=2,  # 突发允许2次额外
             punishment_duration=60  # 1分钟惩罚
         ))
 
-        # 管理员限制 - 30秒5次（统一限制）
+        # 管理员限制 - 60秒30次
         self.add_rule(RateLimitRule(
             name="admin_message_per_30s",
             limit_type=LimitType.SLIDING_WINDOW,
-            max_requests=5,
-            window_seconds=30,
+            max_requests=30,
+            window_seconds=60,
             action_types=[ActionType.MESSAGE],
             user_groups=["admin"],
             burst_allowance=2,  # 突发允许2次额外

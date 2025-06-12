@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from .logging_config import get_logger
 from .settings import settings
 from .store import Conversation
+from .tg_utils import tg_primary_bot
 
 logger = get_logger("app.topic_recovery")
 
@@ -25,6 +26,7 @@ class TopicRecoveryService:
     def __init__(self, conversation_service, tg_func):
         self.conversation_service = conversation_service
         self.tg = tg_func
+        self.tg_primary = tg_primary_bot
         self.logger = get_logger("app.topic_recovery")
 
     async def handle_topic_deleted_error(self, entity_id: int, entity_type: str,
@@ -172,7 +174,7 @@ class TopicRecoveryService:
                 f"对话将继续在此话题中进行。"
             )
 
-            await self.tg("sendMessage", {
+            await self.tg_primary("sendMessage", {
                 "chat_id": settings.SUPPORT_GROUP_ID,
                 "message_thread_id": topic_id,
                 "text": notification_text,

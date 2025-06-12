@@ -11,6 +11,7 @@ from ..cache import CacheManager
 
 logger = get_logger("app.handlers.group")
 
+
 @monitor_performance("handle_group_message")
 async def handle_group(msg: dict, conv_service: ConversationService):
     """处理支持群组聊天和外部群组的入站消息"""
@@ -207,7 +208,7 @@ async def handle_group(msg: dict, conv_service: ConversationService):
                 "chat_id": chat_id,
                 "chat_type": msg.get("chat", {}).get("type"),
                 "message_id": message_id,
-                 "sender_id": sender_id,
+                "sender_id": sender_id,
             },
         )
 
@@ -254,6 +255,13 @@ async def handle_group(msg: dict, conv_service: ConversationService):
         except Exception as e:
             logger.warning(f"获取外部群组 {chat_id} 名称失败: {e}", exc_info=True)
 
+        # ✅ 在这里添加名称更新检查
+        logger.info(f"准备检查群组 {chat_id} 名称更新，当前名称: '{group_name}'")
+        try:
+            await conv_service.update_entity_name_if_changed(chat_id, "group", group_name)
+        except Exception as e:
+            logger.error(f"检查群组名称更新失败: {e}", exc_info=True)
+
         # 处理 /bind 命令
         if raw_text_content_group.lower().startswith("/bind"):
             is_bind_alone = raw_text_content_group.lower() == "/bind"
@@ -269,7 +277,7 @@ async def handle_group(msg: dict, conv_service: ConversationService):
                     await conv_service.get_conversation_by_entity(chat_id, "group")
                 )
 
-                if ( group_conv_for_bind_check and group_conv_for_bind_check.is_verified == "verified"):
+                if (group_conv_for_bind_check and group_conv_for_bind_check.is_verified == "verified"):
                     logger.info(f"群组 {chat_id} 已经绑定验证通过，发送已绑定消息")
                     try:
                         await tg(
@@ -340,7 +348,7 @@ async def handle_group(msg: dict, conv_service: ConversationService):
                     return
 
                 logger.info(
-                     f"群组 {chat_id} ({group_name}) 尝试绑定 ID: '{custom_id}', 提供密码: '{'******' if password_provided else '未提供'}'"
+                    f"群组 {chat_id} ({group_name}) 尝试绑定 ID: '{custom_id}', 提供密码: '{'******' if password_provided else '未提供'}'"
                 )
 
                 try:
@@ -497,7 +505,8 @@ async def handle_group(msg: dict, conv_service: ConversationService):
                     f"成功复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id}"
                 )
             except Exception as e:
-                logger.error(f"复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id} 失败: {e}", exc_info=True)
+                logger.error(f"复制外部群组 {chat_id} 的消息 {message_id} 到话题 {group_conv.topic_id} 失败: {e}",
+                             exc_info=True)
                 try:
                     await tg("sendMessage", {
                         "chat_id": settings.SUPPORT_GROUP_ID,

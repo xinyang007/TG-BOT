@@ -58,6 +58,7 @@ class TelegramAPIError(Exception):
         description_lower = self.description.lower()
         return any(keyword in description_lower for keyword in topic_keywords)
 
+
 async def get_bot_manager():
     """获取机器人管理器实例"""
     global _bot_manager
@@ -76,7 +77,7 @@ def get_base_url(token: str) -> str:
 
 
 async def tg_with_bot_selection(
-    method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
+        method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
 ):
     """
     使用机器人选择策略发送请求到 Telegram Bot API
@@ -152,7 +153,7 @@ async def tg_with_bot_selection(
 
 
 async def tg_with_specific_bot(
-    token: str, method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
+        token: str, method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
 ):
     """
     使用指定token的机器人发送请求到 Telegram Bot API
@@ -303,7 +304,7 @@ async def tg_with_specific_bot(
 
 
 async def tg_single_bot(
-    method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
+        method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
 ):
     """
     使用单机器人模式（原始逻辑），支持向后兼容
@@ -317,8 +318,9 @@ async def tg_single_bot(
 
     return await tg_with_specific_bot(token, method, data, max_retries, initial_delay)
 
+
 async def tg_primary_bot(
-    method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
+        method: str, data: dict, max_retries: int = 5, initial_delay: int = 1
 ):
     """使用主机器人发送请求"""
     token = settings.get_primary_bot_token()
@@ -326,6 +328,7 @@ async def tg_primary_bot(
         raise ValueError("未设置主机器人Token")
 
     return await tg_with_specific_bot(token, method, data, max_retries, initial_delay)
+
 
 async def tg(method: str, data: dict, max_retries: int = 5, initial_delay: int = 1):
     """
@@ -347,11 +350,11 @@ async def tg(method: str, data: dict, max_retries: int = 5, initial_delay: int =
 
 
 async def copy_any(
-    src_chat_id,
-    dst_chat_id,
-    message_id: int,
-    extra_params: dict | None = None,
-    use_primary_bot: bool = False,
+        src_chat_id,
+        dst_chat_id,
+        message_id: int,
+        extra_params: dict | None = None,
+        use_primary_bot: bool = False,
 ):
     """
     复制消息的辅助函数
@@ -372,16 +375,16 @@ async def copy_any(
 
 
 async def send_with_prefix(
-    source_chat_id,
-    dest_chat_id,
-    message_thread_id,
-    sender_name,
-    msg,
-    conversation_service=None,
-    entity_id=None,
-    entity_type=None,
-    entity_name=None,
-    use_primary_bot: bool = False,
+        source_chat_id,
+        dest_chat_id,
+        message_thread_id,
+        sender_name,
+        msg,
+        conversation_service=None,
+        entity_id=None,
+        entity_type=None,
+        entity_name=None,
+        use_primary_bot: bool = False,
 ):
     """发送带前缀的消息，根据消息类型选择不同的发送方法，包含话题恢复功能"""
     prefix = f"👤 {sender_name or '未知发送者'}:\n"
@@ -528,12 +531,12 @@ async def send_with_prefix(
                 {
                     "method": "sendVideo",
                     "data": {
-                            "chat_id": dest_chat_id,
-                            "message_thread_id": message_thread_id,
-                            "video": msg_to_send.get("video", {}).get("file_id"),
-                            "caption": msg_to_send.get("caption"),
-                            "parse_mode": "HTML"
-                            },
+                        "chat_id": dest_chat_id,
+                        "message_thread_id": message_thread_id,
+                        "video": msg_to_send.get("video", {}).get("file_id"),
+                        "caption": msg_to_send.get("caption"),
+                        "parse_mode": "HTML"
+                    },
                 }
             )
         elif "document" in msg_to_send:
@@ -564,18 +567,56 @@ async def send_with_prefix(
                 }
             )
         else:
-            # 回退到 copyMessage
+            # 回退到 copyMessage - 修复消息ID获取逻辑
             logger.debug(f"回退到复制消息模式")
+
+            # 修复：确保消息ID正确获取
+            source_message_id = msg.get("message_id")  # 使用原始消息的message_id
+            if not source_message_id:
+                logger.error("无法获取源消息ID，跳过复制")
+                raise Exception("无法获取源消息ID")
+
+            # 验证消息ID是否为有效整数
+            try:
+                source_message_id = int(source_message_id)
+            except (ValueError, TypeError):
+                logger.error(f"消息ID格式无效: {source_message_id}")
+                raise Exception(f"消息ID格式无效: {source_message_id}")
+
+            logger.debug(f"尝试复制消息 {source_message_id} 从 {source_chat_id} 到 {dest_chat_id}")
+
             try:
                 return await copy_any(
                     source_chat_id,
                     dest_chat_id,
-                    msg_to_send.get("message_id"),
+                    source_message_id,  # 使用修复后的消息ID
                     {"message_thread_id": message_thread_id},
                     use_primary_bot=use_primary_bot,
                 )
             except Exception as copy_error:
                 error_str = str(copy_error).lower()
+
+                # 检查是否是"消息未找到"错误
+                if "message to copy not found" in error_str or "message not found" in error_str:
+                    logger.warning(f"源消息 {source_message_id} 不存在或已被删除，使用文本回退方案")
+
+                    # 回退方案：发送纯文本消息
+                    fallback_text = f"{prefix}{original_body or '消息内容无法复制（原消息可能已被删除）'}"
+
+                    try:
+                        tg_func = tg_primary_bot if use_primary_bot else tg
+                        return await tg_func(
+                            "sendMessage",
+                            {
+                                "chat_id": dest_chat_id,
+                                "message_thread_id": message_thread_id,
+                                "text": fallback_text[:4096],  # 限制长度
+                                "parse_mode": "HTML",
+                            },
+                        )
+                    except Exception as fallback_error:
+                        logger.error(f"文本回退方案也失败: {fallback_error}")
+                        raise fallback_error
 
                 # 尝试话题恢复
                 new_topic_id = await handle_topic_recovery(error_str)
@@ -585,7 +626,7 @@ async def send_with_prefix(
                         return await copy_any(
                             source_chat_id,
                             dest_chat_id,
-                            msg_to_send.get("message_id"),
+                            source_message_id,
                             {"message_thread_id": new_topic_id},
                             use_primary_bot=use_primary_bot,
                         )
@@ -597,13 +638,32 @@ async def send_with_prefix(
                 # 最后回退：不使用话题复制
                 if "thread not found" in error_str or "topic_deleted" in error_str:
                     logger.warning("话题无效，使用无话题的复制")
-                    return await copy_any(
-                        source_chat_id,
-                        dest_chat_id,
-                        msg_to_send.get("message_id"),
-                        {},
-                        use_primary_bot=use_primary_bot,
-                    )
+                    try:
+                        return await copy_any(
+                            source_chat_id,
+                            dest_chat_id,
+                            source_message_id,
+                            {},
+                            use_primary_bot=use_primary_bot,
+                        )
+                    except Exception as no_topic_error:
+                        logger.error(f"无话题复制也失败: {no_topic_error}")
+                        # 最终回退到文本消息
+                        fallback_text = f"{prefix}{original_body or '消息内容无法复制'}"
+
+                        try:
+                            tg_func = tg_primary_bot if use_primary_bot else tg
+                            return await tg_func(
+                                "sendMessage",
+                                {
+                                    "chat_id": dest_chat_id,
+                                    "text": fallback_text[:4096],
+                                    "parse_mode": "HTML",
+                                },
+                            )
+                        except Exception as final_fallback_error:
+                            logger.error(f"最终回退方案失败: {final_fallback_error}")
+                            raise final_fallback_error
                 else:
                     raise copy_error
 
@@ -633,7 +693,7 @@ async def send_with_prefix(
 
 # 为了向后兼容，保留原函数签名的包装器
 async def send_with_prefix_legacy(
-    source_chat_id, dest_chat_id, message_thread_id, sender_name, msg
+        source_chat_id, dest_chat_id, message_thread_id, sender_name, msg
 ):
     """向后兼容的包装器"""
     return await send_with_prefix(

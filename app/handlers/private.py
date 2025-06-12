@@ -291,7 +291,21 @@ async def handle_private(msg: dict, conv_service: ConversationService):
                 await conv_service.reopen_conversation(
                     conv.entity_id, conv.entity_type, conv.topic_id
                 )
-                conv.status = "open"
+                # 重新获取最新的对话状态，而不是直接修改本地对象
+                conv = await conv_service.get_conversation_by_entity(uid, 'user')
+                if not conv or conv.status != "open":
+                    user_logger.error("重新开启对话后状态验证失败")
+                    try:
+                        await tg("sendMessage", {
+                            "chat_id": uid,
+                            "text": "重新开启对话失败，请稍后再试。"
+                        })
+                    except Exception:
+                        pass
+                    return
+
+                user_logger.info(f"对话重新开启成功，话题ID: {conv.topic_id}")
+
             except Exception as e:
                 user_logger.error("重新开启对话失败", exc_info=True)
                 try:
@@ -327,6 +341,12 @@ async def handle_private(msg: dict, conv_service: ConversationService):
     # 跳过命令消息的转发
     if not (is_start_command or is_bind_command or is_bind_command_alone):
         if conv and conv.topic_id:
+            # ✅ 在转发消息前检查用户名称更新
+            user_logger.info(f"准备检查用户 {uid} 名称更新，当前名称: '{user_first_name}'")
+            try:
+                await conv_service.update_entity_name_if_changed(uid, 'user', user_first_name)
+            except Exception as e:
+                user_logger.error(f"检查用户名称更新失败: {e}", exc_info=True)
             try:
                 await send_with_prefix(
                     source_chat_id=uid,

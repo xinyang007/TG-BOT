@@ -2,7 +2,7 @@ import time
 import asyncio
 from typing import Dict, Set
 from dataclasses import dataclass
-from .tg_utils import tg
+from .tg_utils import tg, tg_primary_bot
 from .settings import settings
 from .logging_config import get_logger
 
@@ -129,7 +129,7 @@ class RateLimitNotificationManager:
             payload["allow_sending_without_reply"] = True  # 关键：如果回复失败则正常发送
 
         try:
-            await tg("sendMessage", payload)
+            await tg_primary_bot("sendMessage", payload)
             self.logger.debug(f"✅ 消息发送成功到聊天 {chat_id}")
             return True
 
@@ -154,7 +154,7 @@ class RateLimitNotificationManager:
                 }
 
                 try:
-                    await tg("sendMessage", fallback_payload)
+                    await tg_primary_bot("sendMessage", payload)
                     self.logger.info(f"✅ 回退发送成功到聊天 {chat_id}")
                     return True
                 except Exception as fallback_error:
