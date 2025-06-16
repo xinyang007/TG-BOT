@@ -1,3 +1,5 @@
+import html
+
 import httpx
 import json
 import logging
@@ -387,7 +389,17 @@ async def send_with_prefix(
         use_primary_bot: bool = False,
 ):
     """发送带前缀的消息，根据消息类型选择不同的发送方法，包含话题恢复功能"""
+
+    # 构建基础前缀
     prefix = f"👤 {sender_name or '未知发送者'}:\n"
+
+    # 处理引用消息 - 新增功能
+    reply_context = ""
+    if msg.get("reply_to_message"):
+        reply_msg = msg["reply_to_message"]
+        reply_context = await _build_reply_context(reply_msg)
+        if reply_context:
+            prefix = f"📝 引用消息:\n{reply_context}\n\n{prefix}"
 
     # 创建消息副本进行修改
     msg_to_send = msg.copy()
@@ -689,6 +701,304 @@ async def send_with_prefix(
         except Exception as final_error:
             logger.error(f"所有发送方案都失败: {final_error}")
             raise final_error
+
+
+async def _build_reply_context(reply_msg: dict) -> str:
+    """构建引用消息的上下文文本"""
+    try:
+        # 获取引用消息的发送者信息
+        reply_sender = reply_msg.get("from", {})
+        reply_sender_name = "未知发送者"
+        sender_type = "user"  # user, bot, admin
+
+        if reply_sender:
+            is_bot = reply_sender.get("is_bot", False)
+            sender_id = reply_sender.get("id")
+
+            if is_bot:
+                # 机器人消息 - 可能是主机器人或备用机器人发送的客服回复
+                bot_first_name = reply_sender.get("first_name", "客服机器人")
+                bot_username = reply_sender.get("username", "")
+
+                # 判断是否是已知的机器人
+                known_bot_tokens = []
+                try:
+                    # 获取所有机器人token的bot_id部分用于比较
+                    if hasattr(settings, 'BOT_CONFIGS') and settings.BOT_CONFIGS:
+                        for bot_config in settings.BOT_CONFIGS:
+                            if hasattr(bot_config, 'token') and bot_config.token:
+                                bot_id = bot_config.token.split(':')[0]
+                                known_bot_tokens.append(int(bot_id))
+                    elif settings.BOT_TOKEN:
+                        bot_id = settings.BOT_TOKEN.split(':')[0]
+                        known_bot_tokens.append(int(bot_id))
+                except Exception as e:
+                    logger.debug(f"解析机器人token失败: {e}")
+
+                if sender_id in known_bot_tokens:
+                    # 这是我们的客服机器人（主机器人或备用机器人）
+                    reply_sender_name = f"客服·{bot_first_name}"
+                    sender_type = "admin"  # 统一标记为admin类型
+                else:
+                    # 其他未知机器人
+                    reply_sender_name = f"机器人·{bot_first_name}"
+                    if bot_username:
+                        reply_sender_name += f"@{bot_username}"
+                    sender_type = "unknown_bot"
+            else:
+                # 普通用户消息
+                first_name = reply_sender.get("first_name", "")
+                last_name = reply_sender.get("last_name", "")
+                username = reply_sender.get("username", "")
+
+                if first_name or last_name:
+                    reply_sender_name = f"{first_name} {last_name}".strip()
+                elif username:
+                    reply_sender_name = f"@{username}"
+                else:
+                    reply_sender_name = f"用户{sender_id}" if sender_id else "匿名用户"
+
+                sender_type = "user"
+
+        # 构建引用消息的时间戳（北京时间 UTC+8）
+        time_info = ""
+        if reply_msg.get("date"):
+            import datetime
+            try:
+                # Telegram的date是UTC时间戳
+                utc_time = datetime.datetime.fromtimestamp(reply_msg["date"], tz=datetime.timezone.utc)
+                # 转换为北京时间 (UTC+8)
+                beijing_time = utc_time + datetime.timedelta(hours=8)
+
+                # 获取当前北京时间用于判断是否同一天
+                current_utc = datetime.datetime.now(tz=datetime.timezone.utc)
+                current_beijing = current_utc + datetime.timedelta(hours=8)
+
+                # 如果是今天，只显示时间；如果不是今天，显示日期+时间
+                if beijing_time.date() == current_beijing.date():
+                    time_info = beijing_time.strftime("%H:%M")
+                else:
+                    time_info = beijing_time.strftime("%m-%d %H:%M")
+
+            except Exception as e:
+                logger.debug(f"时间解析失败: {e}")
+                time_info = "时间未知"
+
+        # 提取引用消息的内容
+        reply_content = _extract_message_content(reply_msg)
+
+        # 智能清理转发内容 - 修改逻辑
+        if sender_type == "admin" and reply_content:
+            # 对于我们自己的机器人消息，进行智能清理
+            cleaned_content = _smart_clean_forwarded_content(reply_content)
+            # 只有清理后的内容明显更好时才使用清理后的版本
+            if cleaned_content and len(cleaned_content.strip()) >= len(reply_content.strip()) * 0.3:
+                reply_content = cleaned_content
+
+        # 限制引用内容长度
+        max_length = 120
+        if len(reply_content) > max_length:
+            reply_content = reply_content[:max_length - 3] + "..."
+
+        # 根据发送者类型选择不同的图标和格式
+        if sender_type == "admin":
+            icon = "💬"
+            type_label = "客服"
+        elif sender_type == "unknown_bot":
+            icon = "🤖"
+            type_label = "机器人"
+        else:
+            icon = "👤"
+            type_label = "用户"
+
+        # 构建更简洁美观的引用格式
+        if time_info:
+            header = f"{icon} 引用 {type_label} {reply_sender_name} ({time_info}):"
+        else:
+            header = f"{icon} 引用 {type_label} {reply_sender_name}:"
+
+        # 使用引号包围内容，多行时使用特殊格式
+        if '\n' in reply_content:
+            # 多行内容
+            lines = reply_content.split('\n')
+            formatted_content = f"┌ {lines[0]}\n"
+            for line in lines[1:-1]:
+                formatted_content += f"│ {line}\n"
+            if len(lines) > 1:
+                formatted_content += f"└ {lines[-1]}"
+            context = f"{header}\n{formatted_content}"
+        else:
+            # 单行内容
+            context = f"{header}\n「{reply_content}」"
+
+        return context
+
+    except Exception as e:
+        logger.error(f"构建引用消息上下文失败: {e}", exc_info=True)
+        return "💬 引用消息解析失败"
+
+
+def _extract_message_content(msg: dict) -> str:
+    """提取消息内容"""
+    if msg.get("text"):
+        return msg["text"]
+    elif msg.get("caption"):
+        return msg["caption"]
+    elif msg.get("photo"):
+        content = "📸 图片"
+        if msg.get("caption"):
+            content += f" | {msg['caption']}"
+        return content
+    elif msg.get("video"):
+        content = "🎥 视频"
+        if msg.get("caption"):
+            content += f" | {msg['caption']}"
+        return content
+    elif msg.get("document"):
+        doc = msg.get("document", {})
+        doc_name = doc.get("file_name", "")
+        file_size = doc.get("file_size", 0)
+
+        content = "📄 文档"
+        if doc_name:
+            content += f": {doc_name}"
+        if file_size and file_size > 0:
+            # 转换文件大小为可读格式
+            if file_size < 1024:
+                size_str = f"{file_size}B"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.1f}KB"
+            else:
+                size_str = f"{file_size / (1024 * 1024):.1f}MB"
+            content += f" ({size_str})"
+
+        if msg.get("caption"):
+            content += f" | {msg['caption']}"
+        return content
+    elif msg.get("audio"):
+        audio = msg.get("audio", {})
+        title = audio.get("title", "")
+        duration = audio.get("duration", 0)
+
+        content = "🎵 音频"
+        if title:
+            content += f": {title}"
+        if duration:
+            minutes, seconds = divmod(duration, 60)
+            content += f" ({minutes:02d}:{seconds:02d})"
+        return content
+    elif msg.get("voice"):
+        duration = msg.get("voice", {}).get("duration", 0)
+        if duration:
+            minutes, seconds = divmod(duration, 60)
+            return f"🎤 语音消息 ({minutes:02d}:{seconds:02d})"
+        return "🎤 语音消息"
+    elif msg.get("sticker"):
+        sticker = msg.get("sticker", {})
+        emoji = sticker.get("emoji", "")
+        set_name = sticker.get("set_name", "")
+        content = f"😀 贴纸{emoji}"
+        if set_name:
+            content += f" ({set_name})"
+        return content
+    elif msg.get("animation"):
+        content = "🎬 GIF动图"
+        if msg.get("caption"):
+            content += f" | {msg['caption']}"
+        return content
+    elif msg.get("contact"):
+        contact = msg["contact"]
+        first_name = contact.get("first_name", "")
+        last_name = contact.get("last_name", "")
+        phone = contact.get("phone_number", "")
+
+        name = f"{first_name} {last_name}".strip() or "联系人"
+        content = f"👤 联系人: {name}"
+        if phone:
+            content += f" ({phone})"
+        return content
+    elif msg.get("location"):
+        location = msg.get("location", {})
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+        if latitude and longitude:
+            return f"📍 位置: {latitude:.4f}, {longitude:.4f}"
+        return "📍 位置信息"
+    elif msg.get("venue"):
+        venue = msg["venue"]
+        title = venue.get("title", "地点")
+        address = venue.get("address", "")
+        content = f"🏢 地点: {title}"
+        if address:
+            content += f" ({address})"
+        return content
+    elif msg.get("poll"):
+        poll = msg["poll"]
+        question = poll.get("question", "")
+        poll_type = poll.get("type", "regular")
+        content = f"🗳️ {'匿名投票' if poll_type == 'quiz' else '投票'}"
+        if question:
+            content += f": {question}"
+        return content
+    elif msg.get("game"):
+        game = msg["game"]
+        title = game.get("title", "游戏")
+        return f"🎮 游戏: {title}"
+    elif msg.get("invoice"):
+        invoice = msg["invoice"]
+        title = invoice.get("title", "发票")
+        return f"🧾 发票: {title}"
+    else:
+        return "💬 其他类型消息"
+
+
+def _smart_clean_forwarded_content(content: str) -> str:
+    """智能清理可能包含转发前缀的内容"""
+    try:
+        import re
+
+        # 保存原始内容用于比较
+        original_content = content
+
+        # 模式1: "👤 用户名:\n内容" - 只清理明确的用户前缀
+        pattern1 = r'^👤\s+[^:\n]+:\s*\n'
+        content = re.sub(pattern1, '', content, flags=re.MULTILINE)
+
+        # 模式2: "🏠群组名 | 👤用户名:\n内容" - 清理群组转发前缀
+        pattern2 = r'^🏠[^|]+\|\s*👤[^:\n]+:\s*\n'
+        content = re.sub(pattern2, '', content, flags=re.MULTILINE)
+
+        # 模式3: "-- 发送者: xxx" (在行尾) - 清理发送者后缀
+        pattern3 = r'\n-- 发送者:\s*[^\n]+$'
+        content = re.sub(pattern3, '', content)
+
+        # 模式4: "📝 引用消息:\n...内容..." - 清理引用前缀（避免嵌套）
+        pattern4 = r'^📝\s*引用消息:\s*\n.*?\n\n'
+        content = re.sub(pattern4, '', content, flags=re.DOTALL)
+
+        # 只在有明显改善时才清理
+        # 避免清理掉所有内容或清理得过于激进
+        content = content.strip()
+
+        # 如果清理后内容为空或过短，返回原始内容
+        if not content or len(content.strip()) < len(original_content.strip()) * 0.3:
+            logger.debug("清理结果过短，返回原始内容")
+            return original_content
+
+        # 移除连续的空行
+        content = re.sub(r'\n\s*\n', '\n', content)
+
+        return content if content else original_content
+
+    except Exception as e:
+        logger.debug(f"智能清理转发内容失败: {e}")
+        return content
+
+
+def _clean_forwarded_content(content: str) -> str:
+    """清理可能包含转发前缀的内容（保持向后兼容）"""
+    # 这个函数现在只做基础清理，避免过于激进
+    return _smart_clean_forwarded_content(content)
 
 
 # 为了向后兼容，保留原函数签名的包装器
